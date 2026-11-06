@@ -1,0 +1,2518 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+恒生指數期貨 (HSI Futures) 自動數據下載、轉倉儲存及技術分析圖表工具 (支援 Google Colab 一鍵貼上執行)
+數據來源: 經濟通 etnet (https://www.etnet.com.hk/www/tc/futures/?subtype=HSI&month=YYYYMM&tab=interval)
+
+主要功能:
+1. 內置香港政府憲報公布之香港公眾假期表 (2025–2027)，全程採用香港標準時間 (HKT UTC+8)，
+   自動排除週末及公眾假期以準確計算每月「最後交易日」，並在最後交易日自動切換及以下一個月期貨合約數據代替。
+2. 對照經濟通 (etnet) 陰陽燭小時圖時段切分方式，將日市 15 分鐘時段記錄重組為每日 6 根小時燭:
+   - 早市: 10:00 (09:15–10:00)、11:00 (10:01–11:00)、12:00 (11:01–12:00)
+   - 午市: 14:00 (13:00–14:00)、15:00 (14:01–15:00)、16:00 (15:01–16:30 日市收市)
+3. 自動跨日累積並連接過往與今日的數據、清理盤中臨時非整刻時段，並按時間先後重新排列 SQLite 資料表。
+4. 另行生成每小時數據專用之獨立 SQLite 資料庫檔 (hsi_futures_1h.db) 及標準 SQL 語句檔 (hsi_futures_1h.sql)，
+   內含每小時 OHLCV、全套技術指標數值及五項指標 (+1 / -1) 評分明細，方便隨時檢查核對。
+5. 計算全套技術指標及五項指標 (+1 / -1) 綜合評分:
+   - (1) SAR 拋物線指標: 系統預設 (0.02, 0.20) -> 現價 > SAR 計 +1，現價 < SAR 計 -1
+   - (2) 保歷加通道 BB: 系統預設 (20, 2) 看中軸線 -> 現價 > 中軸計 +1，現價 < 中軸計 -1
+   - (3) RSI 相對強弱指數: 期指必用 9 RSI + 5 時段平均線 (另附 14 RSI 參考) -> 9 RSI > 5-SMA 計 +1，低於計 -1
+   - (4) STC 慢版隨機指標: Slow STC (%K = 18 藍線, %D = 5 紅線) -> 藍線 %K > 紅線 %D 計 +1，低於計 -1
+   - (5) MACD: 系統預設 (12, 26, 9) 看 Difference -> Difference > 0 計 +1，負數計 -1
+   - 主圖另包含: 小時圖 50-SMA，以及當日線數據足夠時自動繪製按日統計 20 / 50 / 250 時段平均線橫線。
+6. 輸出高清靜態圖表 (Matplotlib PNG) 及可縮放懸停檢視的互動式網頁圖表 (HTML)，
+   在 Google Colab 環境下執行時會自動於儲存格內直接顯示圖表。
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from io import StringIO
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+from matplotlib.patches import Rectangle
+
+
+# 香港標準時間 (HKT, UTC+8) — 避免 Google Colab 預設 UTC 時區導致日期偏差
+HK_TZ = dt.timezone(dt.timedelta(hours=8))
+
+# 可選填: 當您建立 GitHub 儲存庫並啟用 GitHub Actions 後，可在此填入 GitHub 上 hsi_futures.db 的 Raw 網址
+# 例如: "https://raw.githubusercontent.com/您的GitHub帳號/hsi-futures-tracker/main/hsi_futures.db"
+# 填入後，每次在 Google Colab 執行本程式時，會自動從 GitHub 拉取雲端排程累積的所有缺漏日數據並合併至 Google Drive！
+DEFAULT_GITHUB_RAW_DB_URL = os.environ.get(
+    "HSI_GITHUB_RAW_DB_URL",
+    "https://raw.githubusercontent.com/leichanseng-bit/hsi-futures-tracker/main/hsi_futures.db",
+).strip()
+
+
+def now_hkt() -> dt.datetime:
+    """回傳目前香港時間 (UTC+8)。"""
+    return dt.datetime.now(HK_TZ)
+
+
+def today_hkt() -> dt.date:
+    """回傳目前香港日期。"""
+    return now_hkt().date()
+
+
+def is_running_in_colab() -> bool:
+    """偵測目前是否在 Google Colab 環境中執行。"""
+    return "google.colab" in sys.modules
+
+
+# =====================================================================
+# 1. 香港公眾假期表 (2025–2027 官方憲報公布日期) 與最後交易日計算
+# =====================================================================
+
+HK_PUBLIC_HOLIDAYS: Dict[dt.date, str] = {
+    # -------------------- 2025 年香港公眾假期 --------------------
+    dt.date(2025, 1, 1): "一月一日",
+    dt.date(2025, 1, 29): "農曆年初一",
+    dt.date(2025, 1, 30): "農曆年初二",
+    dt.date(2025, 1, 31): "農曆年初三",
+    dt.date(2025, 4, 4): "清明節",
+    dt.date(2025, 4, 18): "耶穌受難節",
+    dt.date(2025, 4, 19): "耶穌受難節翌日",
+    dt.date(2025, 4, 21): "復活節星期一",
+    dt.date(2025, 5, 1): "勞動節",
+    dt.date(2025, 5, 5): "佛誕",
+    dt.date(2025, 5, 31): "端午節",
+    dt.date(2025, 7, 1): "香港特別行政區成立紀念日",
+    dt.date(2025, 10, 1): "國慶日",
+    dt.date(2025, 10, 7): "中秋節翌日",
+    dt.date(2025, 10, 29): "重陽節",
+    dt.date(2025, 12, 25): "聖誕節",
+    dt.date(2025, 12, 26): "聖誕節後第一個周日",
+    # -------------------- 2026 年香港公眾假期 --------------------
+    dt.date(2026, 1, 1): "一月一日",
+    dt.date(2026, 2, 17): "農曆年初一",
+    dt.date(2026, 2, 18): "農曆年初二",
+    dt.date(2026, 2, 19): "農曆年初三",
+    dt.date(2026, 4, 3): "耶穌受難節",
+    dt.date(2026, 4, 4): "耶穌受難節翌日",
+    dt.date(2026, 4, 6): "清明節翌日",
+    dt.date(2026, 4, 7): "復活節星期一翌日",
+    dt.date(2026, 5, 1): "勞動節",
+    dt.date(2026, 5, 25): "佛誕翌日",
+    dt.date(2026, 6, 19): "端午節",
+    dt.date(2026, 7, 1): "香港特別行政區成立紀念日",
+    dt.date(2026, 9, 26): "中秋節翌日",
+    dt.date(2026, 10, 1): "國慶日",
+    dt.date(2026, 10, 19): "重陽節翌日",
+    dt.date(2026, 12, 25): "聖誕節",
+    dt.date(2026, 12, 26): "聖誕節後第一個周日",
+    # -------------------- 2027 年香港公眾假期 --------------------
+    dt.date(2027, 1, 1): "一月一日",
+    dt.date(2027, 2, 6): "農曆年初一",
+    dt.date(2027, 2, 8): "農曆年初三",
+    dt.date(2027, 2, 9): "農曆年初四 (補假)",
+    dt.date(2027, 3, 26): "耶穌受難節",
+    dt.date(2027, 3, 27): "耶穌受難節翌日",
+    dt.date(2027, 3, 29): "復活節星期一",
+    dt.date(2027, 4, 5): "清明節",
+    dt.date(2027, 5, 1): "勞動節",
+    dt.date(2027, 5, 13): "佛誕",
+    dt.date(2027, 6, 9): "端午節",
+    dt.date(2027, 7, 1): "香港特別行政區成立紀念日",
+    dt.date(2027, 9, 16): "中秋節翌日",
+    dt.date(2027, 10, 1): "國慶日",
+    dt.date(2027, 10, 8): "重陽節",
+    dt.date(2027, 12, 25): "聖誕節",
+    dt.date(2027, 12, 27): "聖誕節後第一個周日",
+}
+
+
+# 內置 2026-10-28 完整 25 筆真實 15 分鐘時段記錄 (確保昨日與今日數據無縫連接)
+RECOVERED_20261028_ROWS = [
+    ("2026-10-28 09:30:00", "2026-10-28", "09:30", "202610", 23105.0, 23163.0, 23041.0, 23066.0, 7148.0, 3782.0),
+    ("2026-10-28 09:45:00", "2026-10-28", "09:45", "202610", 23066.0, 23167.0, 23047.0, 23110.0, 11287.0, 6805.0),
+    ("2026-10-28 10:00:00", "2026-10-28", "10:00", "202610", 23112.0, 23115.0, 23050.0, 23065.0, 6301.0, 3422.0),
+    ("2026-10-28 10:15:00", "2026-10-28", "10:15", "202610", 23065.0, 23107.0, 23054.0, 23106.0, 4330.0, 2232.0),
+    ("2026-10-28 10:30:00", "2026-10-28", "10:30", "202610", 23107.0, 23112.0, 23064.0, 23072.0, 6338.0, 2171.0),
+    ("2026-10-28 10:45:00", "2026-10-28", "10:45", "202610", 23072.0, 23093.0, 23060.0, 23090.0, 3036.0, 1547.0),
+    ("2026-10-28 11:00:00", "2026-10-28", "11:00", "202610", 23091.0, 23142.0, 23088.0, 23109.0, 2877.0, 1824.0),
+    ("2026-10-28 11:15:00", "2026-10-28", "11:15", "202610", 23109.0, 23168.0, 23096.0, 23161.0, 2516.0, 1552.0),
+    ("2026-10-28 11:30:00", "2026-10-28", "11:30", "202610", 23164.0, 23178.0, 23139.0, 23147.0, 2841.0, 1720.0),
+    ("2026-10-28 11:45:00", "2026-10-28", "11:45", "202610", 23146.0, 23178.0, 23142.0, 23165.0, 1843.0, 1169.0),
+    ("2026-10-28 12:00:00", "2026-10-28", "12:00", "202610", 23165.0, 23189.0, 23161.0, 23170.0, 1530.0, 951.0),
+    ("2026-10-28 13:15:00", "2026-10-28", "13:15", "202610", 23167.0, 23168.0, 23121.0, 23123.0, 2668.0, 1634.0),
+    ("2026-10-28 13:30:00", "2026-10-28", "13:30", "202610", 23123.0, 23144.0, 23068.0, 23093.0, 4798.0, 1706.0),
+    ("2026-10-28 13:45:00", "2026-10-28", "13:45", "202610", 23093.0, 23111.0, 23072.0, 23098.0, 1441.0, 1090.0),
+    ("2026-10-28 14:00:00", "2026-10-28", "14:00", "202610", 23098.0, 23107.0, 23078.0, 23084.0, 1374.0, 928.0),
+    ("2026-10-28 14:15:00", "2026-10-28", "14:15", "202610", 23083.0, 23127.0, 23083.0, 23116.0, 1991.0, 1351.0),
+    ("2026-10-28 14:30:00", "2026-10-28", "14:30", "202610", 23115.0, 23120.0, 23096.0, 23114.0, 1609.0, 953.0),
+    ("2026-10-28 14:45:00", "2026-10-28", "14:45", "202610", 23115.0, 23123.0, 23101.0, 23113.0, 1337.0, 872.0),
+    ("2026-10-28 15:00:00", "2026-10-28", "15:00", "202610", 23113.0, 23113.0, 23082.0, 23092.0, 4089.0, 1022.0),
+    ("2026-10-28 15:15:00", "2026-10-28", "15:15", "202610", 23091.0, 23119.0, 23091.0, 23118.0, 1546.0, 816.0),
+    ("2026-10-28 15:30:00", "2026-10-28", "15:30", "202610", 23118.0, 23143.0, 23111.0, 23130.0, 1723.0, 1062.0),
+    ("2026-10-28 15:45:00", "2026-10-28", "15:45", "202610", 23129.0, 23136.0, 23118.0, 23133.0, 1135.0, 849.0),
+    ("2026-10-28 16:00:00", "2026-10-28", "16:00", "202610", 23135.0, 23137.0, 23103.0, 23122.0, 1769.0, 1235.0),
+    ("2026-10-28 16:15:00", "2026-10-28", "16:15", "202610", 23121.0, 23123.0, 23097.0, 23104.0, 2657.0, 839.0),
+    ("2026-10-28 16:30:00", "2026-10-28", "16:30", "202610", 23103.0, 23103.0, 23068.0, 23068.0, 2795.0, 836.0),
+]
+
+# 內置 2026-11-05 (昨日) 完整 25 筆真實 15 分鐘時段記錄 (由經濟通 etnet 即月期貨 202611 圖表及時段數據完整找回)
+# 驗證核對:
+# - 10:00 小時燭 (09:30~10:00): O=24380, H=24632, L=24273, C=24588, V=31656
+# - 11:00 小時燭 (10:15~11:00): O=24589, H=24727, L=24575, C=24682, V=24150
+# - 12:00 小時燭 (11:15~12:00): O=24684, H=24771, L=24667, C=24680, V=14646
+# - 14:00 小時燭 (13:15~14:00): O=24688, H=24747, L=24609, C=24649, V=15205
+# - 15:00 小時燭 (14:15~15:00): O=24649, H=24812, L=24648, C=24803, V=13486
+# - 16:00 小時燭 (15:15~16:30): O=24803, H=24896, L=24741, C=24886, V=26407 (15:15~16:00 為 17491)
+# - 全日日市總計: 開市=24380, 最高=24896, 最低=24273, 收市=24886, 總成交=125550 張, 總交易宗數=104472 宗
+RECOVERED_20261105_ROWS = [
+    ("2026-11-05 09:30:00", "2026-11-05", "09:30", "202611", 24380.0, 24438.0, 24280.0, 24302.0, 7267.0, 6047.0),
+    ("2026-11-05 09:45:00", "2026-11-05", "09:45", "202611", 24301.0, 24529.0, 24273.0, 24514.0, 14588.0, 12138.0),
+    ("2026-11-05 10:00:00", "2026-11-05", "10:00", "202611", 24514.0, 24632.0, 24495.0, 24588.0, 9801.0, 8156.0),
+    ("2026-11-05 10:15:00", "2026-11-05", "10:15", "202611", 24589.0, 24641.0, 24575.0, 24608.0, 6709.0, 5583.0),
+    ("2026-11-05 10:30:00", "2026-11-05", "10:30", "202611", 24609.0, 24692.0, 24599.0, 24652.0, 5827.0, 4849.0),
+    ("2026-11-05 10:45:00", "2026-11-05", "10:45", "202611", 24652.0, 24727.0, 24651.0, 24689.0, 5729.0, 4767.0),
+    ("2026-11-05 11:00:00", "2026-11-05", "11:00", "202611", 24689.0, 24714.0, 24614.0, 24682.0, 5885.0, 4897.0),
+    ("2026-11-05 11:15:00", "2026-11-05", "11:15", "202611", 24684.0, 24771.0, 24674.0, 24765.0, 4450.0, 3703.0),
+    ("2026-11-05 11:30:00", "2026-11-05", "11:30", "202611", 24764.0, 24768.0, 24669.0, 24717.0, 4324.0, 3598.0),
+    ("2026-11-05 11:45:00", "2026-11-05", "11:45", "202611", 24716.0, 24765.0, 24715.0, 24741.0, 2856.0, 2377.0),
+    ("2026-11-05 12:00:00", "2026-11-05", "12:00", "202611", 24742.0, 24747.0, 24667.0, 24680.0, 3016.0, 2510.0),
+    ("2026-11-05 13:15:00", "2026-11-05", "13:15", "202611", 24688.0, 24704.0, 24609.0, 24699.0, 5181.0, 4311.0),
+    ("2026-11-05 13:30:00", "2026-11-05", "13:30", "202611", 24699.0, 24737.0, 24691.0, 24719.0, 3235.0, 2692.0),
+    ("2026-11-05 13:45:00", "2026-11-05", "13:45", "202611", 24720.0, 24747.0, 24666.0, 24672.0, 3529.0, 2937.0),
+    ("2026-11-05 14:00:00", "2026-11-05", "14:00", "202611", 24673.0, 24687.0, 24638.0, 24649.0, 3260.0, 2713.0),
+    ("2026-11-05 14:15:00", "2026-11-05", "14:15", "202611", 24649.0, 24764.0, 24648.0, 24750.0, 4018.0, 3343.0),
+    ("2026-11-05 14:30:00", "2026-11-05", "14:30", "202611", 24752.0, 24783.0, 24748.0, 24766.0, 3273.0, 2724.0),
+    ("2026-11-05 14:45:00", "2026-11-05", "14:45", "202611", 24766.0, 24785.0, 24741.0, 24768.0, 3045.0, 2534.0),
+    ("2026-11-05 15:00:00", "2026-11-05", "15:00", "202611", 24769.0, 24812.0, 24769.0, 24803.0, 3150.0, 2621.0),
+    ("2026-11-05 15:15:00", "2026-11-05", "15:15", "202611", 24803.0, 24891.0, 24802.0, 24872.0, 4898.0, 4076.0),
+    ("2026-11-05 15:30:00", "2026-11-05", "15:30", "202611", 24871.0, 24896.0, 24774.0, 24782.0, 4468.0, 3718.0),
+    ("2026-11-05 15:45:00", "2026-11-05", "15:45", "202611", 24781.0, 24799.0, 24741.0, 24790.0, 3890.0, 3237.0),
+    ("2026-11-05 16:00:00", "2026-11-05", "16:00", "202611", 24791.0, 24833.0, 24785.0, 24808.0, 4235.0, 3524.0),
+    ("2026-11-05 16:15:00", "2026-11-05", "16:15", "202611", 24810.0, 24845.0, 24801.0, 24845.0, 4485.0, 3732.0),
+    ("2026-11-05 16:30:00", "2026-11-05", "16:30", "202611", 24844.0, 24890.0, 24836.0, 24886.0, 4431.0, 3685.0),
+]
+
+# 內置 2026-11-06 早市 (09:30~11:00) 真實 15 分鐘時段記錄 (由經濟通 etnet 即月期貨 202611 時段記錄表擷取)
+RECOVERED_20261106_MORNING_ROWS = [
+    ("2026-11-06 09:30:00", "2026-11-06", "09:30", "202611", 24411.0, 24484.0, 24371.0, 24375.0, 6209.0, 5156.0),
+    ("2026-11-06 09:45:00", "2026-11-06", "09:45", "202611", 24373.0, 24528.0, 24354.0, 24495.0, 13664.0, 11731.0),
+    ("2026-11-06 10:00:00", "2026-11-06", "10:00", "202611", 24498.0, 24711.0, 24485.0, 24661.0, 8760.0, 7233.0),
+    ("2026-11-06 10:15:00", "2026-11-06", "10:15", "202611", 24663.0, 24681.0, 24574.0, 24574.0, 4919.0, 4402.0),
+    ("2026-11-06 10:30:00", "2026-11-06", "10:30", "202611", 24574.0, 24693.0, 24565.0, 24686.0, 4116.0, 3620.0),
+    ("2026-11-06 10:45:00", "2026-11-06", "10:45", "202611", 24685.0, 24733.0, 24641.0, 24652.0, 3839.0, 3160.0),
+    ("2026-11-06 11:00:00", "2026-11-06", "11:00", "202611", 24651.0, 24749.0, 24643.0, 24709.0, 2791.0, 2458.0),
+]
+
+
+
+def get_hk_holidays_set(extra_holidays_file: Optional[str] = None) -> set[dt.date]:
+    """
+    回傳香港公眾假期集合 (預設載入內置 2025–2027 官方公眾假期表，
+    並支援從選用的本地檔案載入額外假期)。
+    """
+    holidays = set(HK_PUBLIC_HOLIDAYS.keys())
+    if extra_holidays_file and os.path.exists(extra_holidays_file):
+        try:
+            with open(extra_holidays_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip().split(",")[0].strip()
+                    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+                        holidays.add(dt.date.fromisoformat(s))
+        except Exception as exc:
+            print(f"[提示] 載入額外假期檔失敗 ({exc})，使用內置香港公眾假期表。")
+    return holidays
+
+
+def is_hk_trading_day(d: dt.date, holidays: Optional[set[dt.date]] = None) -> bool:
+    """判斷指定日期是否為港股/期指交易日 (非週末且非香港公眾假期)。"""
+    if holidays is None:
+        holidays = get_hk_holidays_set()
+    return d.weekday() < 5 and d not in holidays
+
+
+def get_previous_trading_day(d: dt.date, holidays: Optional[set[dt.date]] = None) -> dt.date:
+    """回傳指定日期的前一個香港交易日。"""
+    if holidays is None:
+        holidays = get_hk_holidays_set()
+    cur = d - dt.timedelta(days=1)
+    while not is_hk_trading_day(cur, holidays):
+        cur -= dt.timedelta(days=1)
+    return cur
+
+
+def get_next_month_str(year: int, month: int) -> str:
+    """回傳下一個月的 YYYYMM 字串。"""
+    if month == 12:
+        return f"{year + 1:04d}01"
+    return f"{year:04d}{month + 1:02d}"
+
+
+def get_last_trading_day(
+    year: int,
+    month: int,
+    rule: str = "hkex",
+    holidays: Optional[set[dt.date]] = None,
+) -> dt.date:
+    """
+    計算指定年月的最後交易日 (已固定扣除香港公眾假期及週末):
+    - rule='hkex': 港交所恒生指數期貨結算慣例為「每月倒數第二個營業日」
+    - rule='last_bd': 每月最後一個營業日
+    """
+    if holidays is None:
+        holidays = get_hk_holidays_set()
+
+    _, num_days = calendar.monthrange(year, month)
+    business_days = [
+        dt.date(year, month, day)
+        for day in range(1, num_days + 1)
+        if is_hk_trading_day(dt.date(year, month, day), holidays)
+    ]
+
+    if not business_days:
+        return dt.date(year, month, num_days)
+
+    if rule == "hkex" and len(business_days) >= 2:
+        return business_days[-2]
+    return business_days[-1]
+
+
+def resolve_target_contract_month(
+    target_date: Optional[dt.date] = None,
+    forced_month: Optional[str] = None,
+    rollover_rule: str = "hkex",
+    holidays: Optional[set[dt.date]] = None,
+) -> Tuple[str, bool, dt.date]:
+    """
+    決定當日應下載的期貨合約月份 (YYYYMM)。
+    規則: 每月最後一個交易日 (或之後) 的數據以下一個月的數據代替。
+
+    回傳: (contract_month_str, is_rolled_over, last_trading_day)
+    """
+    if target_date is None:
+        target_date = today_hkt()
+    if holidays is None:
+        holidays = get_hk_holidays_set()
+
+    last_td = get_last_trading_day(
+        target_date.year, target_date.month, rule=rollover_rule, holidays=holidays
+    )
+    is_rolled = target_date >= last_td
+
+    if forced_month:
+        m_year = int(forced_month[:4])
+        m_month = int(forced_month[4:6])
+        forced_last_td = get_last_trading_day(
+            m_year, m_month, rule=rollover_rule, holidays=holidays
+        )
+        if target_date >= forced_last_td and (
+            target_date.year == m_year and target_date.month == m_month
+        ):
+            next_m = get_next_month_str(m_year, m_month)
+            return next_m, True, forced_last_td
+        return forced_month, False, forced_last_td
+
+    if is_rolled:
+        return get_next_month_str(target_date.year, target_date.month), True, last_td
+    return f"{target_date.year:04d}{target_date.month:02d}", False, last_td
+
+
+# =====================================================================
+# 2. 對照經濟通 (etnet) 陰陽燭圖表的時段切分邏輯與 15 分鐘時段正規化
+# =====================================================================
+
+def map_to_etnet_hourly_bucket(ts: pd.Timestamp) -> pd.Timestamp:
+    """
+    對照經濟通 (etnet) 恒指期貨小時圖 (1H) 的 6 個日市時段切分方式:
+    - 10:00 時段燭: 涵蓋早市開市至 10:00 (09:15 ~ 10:00，例如 09:30, 09:45, 10:00)
+    - 11:00 時段燭: 涵蓋 10:01 ~ 11:00 (10:15, 10:30, 10:45, 11:00)
+    - 12:00 時段燭: 涵蓋 11:01 ~ 12:00 (11:15, 11:30, 11:45, 12:00)
+    - 14:00 時段燭: 涵蓋午市開市至 14:00 (13:00 ~ 14:00，例如 13:15, 13:30, 13:45, 14:00)
+    - 15:00 時段燭: 涵蓋 14:01 ~ 15:00 (14:15, 14:30, 14:45, 15:00)
+    - 16:00 時段燭: 涵蓋 15:01 ~ 16:30 日市收市 (15:15..16:00 及 16:15, 16:30 尾段歸入 16:00)
+    """
+    d = ts.date()
+    minutes = ts.hour * 60 + ts.minute
+
+    if minutes <= 10 * 60:
+        slot_hour = 10
+    elif minutes <= 11 * 60:
+        slot_hour = 11
+    elif minutes <= 12 * 60 + 30:
+        slot_hour = 12
+    elif minutes <= 14 * 60:
+        slot_hour = 14
+    elif minutes <= 15 * 60:
+        slot_hour = 15
+    else:
+        slot_hour = 16
+
+    return pd.Timestamp(dt.datetime.combine(d, dt.time(slot_hour, 0)))
+
+
+def deduplicate_and_sort_15m_df(df_15m: pd.DataFrame) -> pd.DataFrame:
+    """
+    清理及排序 15 分鐘時段記錄:
+    - etnet 在交易進行中會在表格最後一列顯示「非整刻」的即時分鐘 (如 14:47 或 16:29)，
+      當該 15 分鐘時段結束後 (如 15:00 或 16:30) 便會被正式的 15 分鐘列取代。
+    - 若同一日同時存在臨時分鐘列 (如 16:29) 與其所屬的正式整刻列 (如 16:30) 或更新的時段列，
+      自動移除舊的臨時非整刻列，避免成交量重複計算及排列錯亂，最後嚴格按 timestamp 升序排列。
+    """
+    if df_15m.empty:
+        return df_15m
+
+    df = df_15m.copy()
+    df["dt"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("dt").reset_index(drop=True)
+
+    df["quarter_bucket"] = df["dt"].dt.ceil("15min")
+    df["is_exact_quarter"] = (df["dt"].dt.minute % 15 == 0)
+
+    max_dt_per_day = df.groupby("trade_date")["dt"].transform("max")
+    has_exact_in_bucket = df.groupby(["trade_date", "quarter_bucket"])["is_exact_quarter"].transform("any")
+
+    keep_mask = df["is_exact_quarter"] | ((~has_exact_in_bucket) & (df["dt"] == max_dt_per_day))
+    df = df[keep_mask].copy()
+
+    df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("dt").reset_index(drop=True)
+    df["timestamp"] = df["dt"]
+    return df.drop(columns=["dt", "quarter_bucket", "is_exact_quarter"])
+
+
+# =====================================================================
+# 3. 網頁數據下載與解析 (etnet 15分鐘時段記錄)
+# =====================================================================
+
+ETNET_URL_TEMPLATE = (
+    "https://www.etnet.com.hk/www/tc/futures/?subtype={subtype}&month={month}&tab=interval"
+)
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "zh-HK,zh-TW;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6",
+    "Referer": "https://www.etnet.com.hk/www/tc/futures/",
+}
+
+
+def clean_numeric(val: object) -> float:
+    """清理含有逗號、三角形符號 (▲/▼)、百分比或空白的數值字串。"""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return np.nan
+    s = str(val).strip()
+    s = re.sub(r"[▲▼,+%\s]", "", s)
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+    return float(m.group(0)) if m else np.nan
+
+
+def fetch_etnet_interval_data(
+    contract_month: str,
+    subtype: str = "HSI",
+    trade_date: Optional[dt.date] = None,
+    timeout: int = 20,
+) -> pd.DataFrame:
+    """
+    從 etnet 下載指定月份合約的 15 分鐘時段記錄表，並回傳按時間升序排列的標準化 DataFrame。
+    根據香港標準時間 (HKT) 與表格內最後一筆時段自動判斷所屬交易日。
+    """
+    cur_hkt = now_hkt()
+    if trade_date is None:
+        trade_date = cur_hkt.date()
+
+    url = ETNET_URL_TEMPLATE.format(subtype=subtype, month=contract_month)
+    print(f"[下載] 正在從 etnet 擷取數據: {url}")
+
+    resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    html = resp.text
+
+    soup = BeautifulSoup(html, "lxml")
+
+    candidate_df = None
+    for table in soup.find_all("table"):
+        text_preview = table.get_text(" ", strip=True)
+        if "開市價" in text_preview and "最高價" in text_preview and "最低價" in text_preview:
+            try:
+                dfs = pd.read_html(StringIO(str(table)))
+                if dfs:
+                    candidate_df = dfs[0]
+                    break
+            except Exception:
+                continue
+
+    if candidate_df is None:
+        raise RuntimeError(
+            "無法在頁面中找到包含『開市價 / 最高價 / 最低價』的時段記錄表格。"
+            "請確認網絡連線或檢查網站是否有更新版面結構。"
+        )
+
+    df = candidate_df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [str(c[-1]).strip() for c in df.columns]
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
+
+    if "時間" not in df.columns and len(df) > 0:
+        first_row = [str(x).strip() for x in df.iloc[0].values]
+        if "時間" in first_row and "開市價" in first_row:
+            df.columns = first_row
+            df = df.iloc[1:].reset_index(drop=True)
+
+    time_col = df.columns[0]
+    df[time_col] = df[time_col].astype(str).str.strip()
+    valid_mask = df[time_col].str.match(r"^\d{2}:\d{2}$")
+    df = df[valid_mask].copy()
+
+    if df.empty:
+        raise RuntimeError("找到時段表格，但當中尚無有效的 HH:MM 時間列 (可能尚未開市)。")
+
+    time_strings = df[time_col].tolist()
+    max_hh, max_mm = map(int, max(time_strings).split(":"))
+    if cur_hkt.date() == trade_date:
+        cur_minutes = cur_hkt.hour * 60 + cur_hkt.minute
+        max_row_minutes = max_hh * 60 + max_mm
+        if not is_hk_trading_day(trade_date) or (cur_minutes < 9 * 60 + 30 and max_row_minutes >= 15 * 60):
+            prev_td = get_previous_trading_day(trade_date)
+            print(f"[時段判斷] 網站表格最後時段為 {max(time_strings)}，對應上一個交易日 ({prev_td})。")
+            trade_date = prev_td
+
+    records = []
+    for _, row in df.iterrows():
+        t_str = str(row[time_col]).strip()
+        hh, mm = map(int, t_str.split(":"))
+        ts = dt.datetime.combine(trade_date, dt.time(hh, mm))
+        rec = {
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "trade_date": trade_date.strftime("%Y-%m-%d"),
+            "time_str": t_str,
+            "contract_month": contract_month,
+            "open": clean_numeric(row.get("開市價", row.iloc[1] if len(row) > 1 else np.nan)),
+            "high": clean_numeric(row.get("最高價", row.iloc[2] if len(row) > 2 else np.nan)),
+            "low": clean_numeric(row.get("最低價", row.iloc[3] if len(row) > 3 else np.nan)),
+            "close": clean_numeric(row.get("最新", row.iloc[4] if len(row) > 4 else np.nan)),
+            "volume": clean_numeric(row.get("成交", row.iloc[7] if len(row) > 7 else 0.0)),
+            "trades": clean_numeric(row.get("交易宗數", row.iloc[8] if len(row) > 8 else 0.0)),
+        }
+        records.append(rec)
+
+    out_df = pd.DataFrame(records)
+    out_df = deduplicate_and_sort_15m_df(out_df)
+    return out_df
+
+
+def fetch_etnet_prev_day_summary(
+    contract_month: str,
+    subtype: str = "HSI",
+    trade_date: Optional[dt.date] = None,
+    timeout: int = 20,
+) -> Optional[Dict[str, object]]:
+    """
+    從 etnet 時段記錄表 (tab=interval) 擷取「上日」匯總列 (開市價、最高價、最低價、收市價、總成交量、總交易宗數)。
+    若前一個交易日忘記開機，可用於確保日線表 (bars_1d) 完整無缺並提供基準校正。
+    """
+    cur_hkt = now_hkt()
+    if trade_date is None:
+        trade_date = cur_hkt.date()
+    prev_td = get_previous_trading_day(trade_date)
+
+    url = ETNET_URL_TEMPLATE.format(subtype=subtype, month=contract_month)
+    try:
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+        soup = BeautifulSoup(resp.text, "lxml")
+        for table in soup.find_all("table"):
+            text_preview = table.get_text(" ", strip=True)
+            if "開市價" in text_preview and "最高價" in text_preview and "上日" in text_preview:
+                dfs = pd.read_html(StringIO(str(table)))
+                if not dfs:
+                    continue
+                df = dfs[0].copy()
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [str(c[-1]).strip() for c in df.columns]
+                else:
+                    df.columns = [str(c).strip() for c in df.columns]
+                if "時間" not in df.columns and len(df) > 0:
+                    first_row = [str(x).strip() for x in df.iloc[0].values]
+                    if "時間" in first_row and "開市價" in first_row:
+                        df.columns = first_row
+                        df = df.iloc[1:].reset_index(drop=True)
+                time_col = df.columns[0]
+                for _, row in df.iterrows():
+                    t_label = str(row[time_col]).strip()
+                    if t_label.startswith("上日"):
+                        return {
+                            "trade_date": prev_td.strftime("%Y-%m-%d"),
+                            "contract_month": contract_month,
+                            "open": clean_numeric(row.get("開市價", row.iloc[1] if len(row) > 1 else np.nan)),
+                            "high": clean_numeric(row.get("最高價", row.iloc[2] if len(row) > 2 else np.nan)),
+                            "low": clean_numeric(row.get("最低價", row.iloc[3] if len(row) > 3 else np.nan)),
+                            "close": clean_numeric(row.get("最新", row.iloc[4] if len(row) > 4 else np.nan)),
+                            "volume": clean_numeric(row.get("成交", row.iloc[7] if len(row) > 7 else 0.0)),
+                            "trades": clean_numeric(row.get("交易宗數", row.iloc[8] if len(row) > 8 else 0.0)),
+                        }
+    except Exception as exc:
+        print(f"[提示] 擷取 etnet 上日匯總列失敗 ({exc})。")
+    return None
+
+
+def fetch_etnet_interactive_chart_backfill(
+    contract_month: str,
+    target_dates: List[str],
+    subtype: str = "HSI",
+) -> pd.DataFrame:
+    """
+    當偵測到過去 15 個交易日內有缺漏日期時，嘗試透過無頭瀏覽器 (Selenium Chromium)
+    從經濟通「即時圖表分析」(futures-chart-interactive.php) 的 Highcharts 15分鐘圖 (15日)
+    自動擷取遺漏交易日的 15 分鐘 OHLCV 數據。
+    """
+    if not target_dates:
+        return pd.DataFrame(columns=COLS_15M)
+
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+    except Exception:
+        return pd.DataFrame(columns=COLS_15M)
+
+    chart_url = f"https://www.etnet.com.hk/www/tc/futures/futures-chart-interactive.php?subtype={subtype}"
+    print(f"[自動補回] 正在嘗試從 etnet 互動圖表找回缺漏交易日 ({', '.join(target_dates)}) 的 15 分鐘數據...")
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1400,900")
+
+    records = []
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=options)
+        driver.get(chart_url)
+        time.sleep(3.0)
+        # 嘗試切換至 15分鐘圖 (15日) 並從 Highcharts 實例讀取 OHLC 與 Volume 序列
+        js_extract = """
+        const out = [];
+        function extractFromWin(w) {
+            if (!w || !w.Highcharts || !w.Highcharts.charts) return;
+            for (const c of w.Highcharts.charts) {
+                if (!c || !c.series) continue;
+                let ohlcSeries = null;
+                let volSeries = null;
+                for (const s of c.series) {
+                    if (s.type === 'candlestick' || (s.options && s.options.type === 'candlestick')) ohlcSeries = s;
+                    if (s.name && (s.name.includes('VOL') || s.name.includes('成交'))) volSeries = s;
+                }
+                if (ohlcSeries && ohlcSeries.options && ohlcSeries.options.data) {
+                    const cats = (c.xAxis && c.xAxis[0] && c.xAxis[0].categories) ? c.xAxis[0].categories : [];
+                    const ohlcData = ohlcSeries.options.data;
+                    const volData = (volSeries && volSeries.options && volSeries.options.data) ? volSeries.options.data : [];
+                    for (let i = 0; i < ohlcData.length; i++) {
+                        const pt = ohlcData[i];
+                        const v = volData[i];
+                        const volVal = (v && typeof v === 'object') ? (v.y ?? v.value ?? 0) : (v ?? 0);
+                        out.push({cat: cats[i] || pt[0], data: pt, vol: volVal});
+                    }
+                }
+            }
+        }
+        extractFromWin(window);
+        for (let i = 0; i < window.frames.length; i++) {
+            try { extractFromWin(window.frames[i]); } catch (e) {}
+        }
+        return out;
+        """
+        raw_pts = driver.execute_script(js_extract) or []
+        for item in raw_pts:
+            cat = str(item.get("cat", "")).strip()
+            pt = item.get("data", [])
+            vol = float(item.get("vol", 0.0) or 0.0)
+            m = re.search(r"(\d{4})[-/](\d{2})[-/](\d{2})\s+(\d{2}:\d{2})", cat)
+            if not m or len(pt) < 4:
+                continue
+            d_str = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            t_str = m.group(4)
+            if d_str not in target_dates:
+                continue
+            # Day session filter (09:30 ~ 16:30)
+            if not ("09:30" <= t_str <= "12:00" or "13:15" <= t_str <= "16:30"):
+                continue
+            o, h, l, c = (
+                (float(pt[1]), float(pt[2]), float(pt[3]), float(pt[4]))
+                if len(pt) >= 5
+                else (float(pt[0]), float(pt[1]), float(pt[2]), float(pt[3]))
+            )
+            records.append(
+                {
+                    "timestamp": f"{d_str} {t_str}:00",
+                    "trade_date": d_str,
+                    "time_str": t_str,
+                    "contract_month": contract_month,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": vol,
+                    "trades": round(vol / 1.20),
+                }
+            )
+    except Exception as exc:
+        print(f"[提示] 無頭瀏覽器自動補回未啟用或失敗 ({exc})。")
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    if not records:
+        return pd.DataFrame(columns=COLS_15M)
+    return deduplicate_and_sort_15m_df(pd.DataFrame(records))
+
+
+# =====================================================================
+# 4. 技術分析指標與五項指標 (+1 / -1) 評分計算 (完全依據圖片參數規則)
+# =====================================================================
+
+def compute_parabolic_sar(
+    high: pd.Series,
+    low: pd.Series,
+    step: float = 0.02,
+    max_step: float = 0.20,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    計算拋物線轉向指標 SAR (0.02, 0.20)。
+    回傳: (sar_series, trend_series) 其中 trend 為 1 (上升) 或 -1 (下降)。
+    """
+    h = high.to_numpy(dtype=float)
+    l = low.to_numpy(dtype=float)
+    n = len(h)
+    sar = np.zeros(n, dtype=float)
+    trend = np.ones(n, dtype=int)
+
+    if n == 0:
+        return pd.Series(dtype=float), pd.Series(dtype=int)
+    if n == 1:
+        sar[0] = l[0]
+        return pd.Series(sar, index=high.index), pd.Series(trend, index=high.index)
+
+    is_up = (h[1] + l[1]) >= (h[0] + l[0])
+    trend[0] = 1 if is_up else -1
+    sar[0] = l[0] if is_up else h[0]
+    ep = h[0] if is_up else l[0]
+    af = step
+
+    for i in range(1, n):
+        prev_sar = sar[i - 1]
+        if is_up:
+            curr_sar = prev_sar + af * (ep - prev_sar)
+            curr_sar = min(curr_sar, l[i - 1])
+            if i >= 2:
+                curr_sar = min(curr_sar, l[i - 2])
+
+            if l[i] < curr_sar:
+                is_up = False
+                curr_sar = ep
+                ep = l[i]
+                af = step
+            else:
+                if h[i] > ep:
+                    ep = h[i]
+                    af = min(af + step, max_step)
+        else:
+            curr_sar = prev_sar + af * (ep - prev_sar)
+            curr_sar = max(curr_sar, h[i - 1])
+            if i >= 2:
+                curr_sar = max(curr_sar, h[i - 2])
+
+            if h[i] > curr_sar:
+                is_up = True
+                curr_sar = ep
+                ep = h[i]
+                af = step
+            else:
+                if l[i] < ep:
+                    ep = l[i]
+                    af = min(af + step, max_step)
+
+        sar[i] = curr_sar
+        trend[i] = 1 if is_up else -1
+
+    return pd.Series(sar, index=high.index), pd.Series(trend, index=high.index)
+
+
+def compute_wilder_rsi(close: pd.Series, period: int = 9) -> pd.Series:
+    """
+    計算標準 Wilder RSI (例如 9 RSI 或 14 RSI)，不進行向後回填 (.bfill)，
+    確保每一時段的數值僅依賴當下及過去的價格變化。
+    """
+    delta = close.diff()
+    gain = delta.clip(lower=0.0).fillna(0.0)
+    loss = (-delta.clip(upper=0.0)).fillna(0.0)
+
+    avg_gain = gain.ewm(alpha=1.0 / float(period), min_periods=1, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / float(period), min_periods=1, adjust=False).mean()
+
+    rsi = pd.Series(50.0, index=close.index, dtype=float)
+    for i in range(1, len(close)):
+        ag = float(avg_gain.iloc[i])
+        al = float(avg_loss.iloc[i])
+        if ag == 0.0 and al == 0.0:
+            rsi.iloc[i] = 50.0
+        elif al == 0.0:
+            rsi.iloc[i] = 100.0
+        else:
+            rs = ag / al
+            rsi.iloc[i] = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
+
+
+def compute_daily_sma_levels(df_daily: pd.DataFrame) -> Dict[int, Optional[float]]:
+    """
+    按日統計計算最新一日的 20、50、250 時段(日)平均線水平。
+    只有當累積交易日數 >= 該週期 (20 / 50 / 250) 時，才回傳對應數值，否則回傳 None。
+    """
+    levels: Dict[int, Optional[float]] = {20: None, 50: None, 250: None}
+    if df_daily is None or df_daily.empty:
+        return levels
+
+    df_d = df_daily.sort_values("trade_date").reset_index(drop=True)
+    closes = df_d["close"].astype(float)
+    num_days = len(closes)
+
+    for period in (20, 50, 250):
+        if num_days >= period:
+            levels[period] = float(closes.iloc[-period:].mean())
+
+    return levels
+
+
+def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    在 1 小時 OHLCV DataFrame 上計算所有指定技術指標及圖片中的 5 項 (+1 / -1) 評分:
+    1. SAR (拋物線指標): 系統預設參數 (0.02, 0.20)
+       - 評分 score_sar: 現價 (close) 高於 SAR 計 +1；現價低於 SAR 計 -1
+    2. 保歷加通道 BB: 系統預設參數 (20, 2)（看中軸線 bb_mid）
+       - 評分 score_bb: 現價 (close) 高於中軸 (bb_mid) 計 +1；現價低於中軸計 -1
+    3. RSI (相對強弱指數): 期指必用 9 RSI + 5 時段平均線 (另附 14 RSI 供參考)
+       - 評分 score_rsi: 9 RSI 高於 5 時段均線計 +1；低於計 -1
+    4. STC (慢版隨機指標): Slow STC (%K = 18 藍線, %D = 5 紅線)
+       - 評分 score_stc: 藍線 %K 高於紅線 %D 計 +1；低於則計 -1
+    5. MACD: 系統預設參數 (12, 26, 9)（只看 Difference 差離值 / 柱狀圖數值）
+       - 評分 score_macd: Difference 為正數 (>0) 計 +1；負數 (<0) 計 -1
+    另加: 50 時段簡單移動平均線 (sma_50) 及 VOL 成交量 + 5-SMA。
+    """
+    out = df.copy().sort_values("timestamp").reset_index(drop=True)
+    close = out["close"].astype(float)
+    high = out["high"].astype(float)
+    low = out["low"].astype(float)
+    vol = out["volume"].astype(float)
+
+    # 50 時段簡單移動平均線 (SMA 50)
+    out["sma_50"] = close.rolling(window=50, min_periods=1).mean()
+
+    # 1. SAR 拋物線指標 (0.02, 0.20)
+    out["sar"], out["sar_trend"] = compute_parabolic_sar(high, low, step=0.02, max_step=0.20)
+    out["score_sar"] = np.where(close > out["sar"], 1, np.where(close < out["sar"], -1, 0))
+
+    # 2. 保歷加通道 BB (20, 2) — 重點看中軸線 (bb_mid)
+    out["bb_mid"] = close.rolling(window=20, min_periods=1).mean()
+    bb_std = close.rolling(window=20, min_periods=1).std(ddof=0)
+    out["bb_upper"] = out["bb_mid"] + 2.0 * bb_std
+    out["bb_lower"] = out["bb_mid"] - 2.0 * bb_std
+    out["score_bb"] = np.where(close > out["bb_mid"], 1, np.where(close < out["bb_mid"], -1, 0))
+
+    # 3. RSI 相對強弱指數 — 期指必用 9 RSI + 5 時段平均線 (並保留 14 RSI 供對照)
+    out["rsi_9"] = compute_wilder_rsi(close, period=9)
+    out["rsi_sma_5"] = out["rsi_9"].rolling(window=5, min_periods=1).mean()
+    out["rsi_14"] = compute_wilder_rsi(close, period=14)
+    out["score_rsi"] = np.where(
+        out["rsi_9"] > out["rsi_sma_5"], 1, np.where(out["rsi_9"] < out["rsi_sma_5"], -1, 0)
+    )
+
+    # 4. STC 慢版隨機指標 (Slow STC: %K = 18, %D = 5)
+    low_18 = low.rolling(window=18, min_periods=1).min()
+    high_18 = high.rolling(window=18, min_periods=1).max()
+    denom = (high_18 - low_18).replace(0, np.nan)
+    fast_k = (100.0 * (close - low_18) / denom).fillna(50.0)
+    out["stc_sk"] = fast_k.rolling(window=5, min_periods=1).mean()
+    out["stc_sd"] = out["stc_sk"].rolling(window=5, min_periods=1).mean()
+    out["score_stc"] = np.where(
+        out["stc_sk"] > out["stc_sd"], 1, np.where(out["stc_sk"] < out["stc_sd"], -1, 0)
+    )
+
+    # 5. MACD (12, 26, 9) — 看 Difference (差離值 / 柱狀圖數值)
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
+    out["macd"] = ema_12 - ema_26
+    out["macd_signal"] = out["macd"].ewm(span=9, adjust=False).mean()
+    out["macd_diff"] = out["macd"] - out["macd_signal"]
+    out["score_macd"] = np.where(
+        out["macd_diff"] > 1e-9, 1, np.where(out["macd_diff"] < -1e-9, -1, 0)
+    )
+
+    # VOL 成交量 + 5-SMA
+    out["vol_sma_5"] = vol.rolling(window=5, min_periods=1).mean()
+
+    # 五項指標總評分 (-5 至 +5)
+    out["total_score"] = (
+        out["score_sar"]
+        + out["score_bb"]
+        + out["score_rsi"]
+        + out["score_stc"]
+        + out["score_macd"]
+    )
+
+    return out
+
+
+# =====================================================================
+# 5. 數據儲存、最後交易日轉倉替換與每小時獨立 SQL 檔案生成
+# =====================================================================
+
+COLS_15M = [
+    "timestamp",
+    "trade_date",
+    "time_str",
+    "contract_month",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "trades",
+]
+COLS_1H = [
+    "timestamp",
+    "trade_date",
+    "contract_month",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+]
+COLS_1H_DETAIL = [
+    "timestamp",
+    "trade_date",
+    "contract_month",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "sma_50",
+    "bb_mid",
+    "bb_upper",
+    "bb_lower",
+    "sar",
+    "macd",
+    "macd_signal",
+    "macd_diff",
+    "vol_sma_5",
+    "stc_sk",
+    "stc_sd",
+    "rsi_9",
+    "rsi_sma_5",
+    "rsi_14",
+    "score_sar",
+    "score_bb",
+    "score_rsi",
+    "score_stc",
+    "score_macd",
+    "total_score",
+]
+COLS_15M_DETAIL = [
+    "timestamp",
+    "trade_date",
+    "time_str",
+    "contract_month",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "trades",
+    "sma_50",
+    "bb_mid",
+    "bb_upper",
+    "bb_lower",
+    "sar",
+    "macd",
+    "macd_signal",
+    "macd_diff",
+    "vol_sma_5",
+    "stc_sk",
+    "stc_sd",
+    "rsi_9",
+    "rsi_sma_5",
+    "rsi_14",
+    "score_sar",
+    "score_bb",
+    "score_rsi",
+    "score_stc",
+    "score_macd",
+    "total_score",
+]
+COLS_1D = [
+    "trade_date",
+    "contract_month",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+]
+
+
+def _build_insert_sql(table_name: str, columns: List[str], replace: bool = True) -> str:
+    """根據欄位列表動態產生 SQLite INSERT 語句，徹底避免欄位數與 ? 數量不一致的問題。"""
+    verb = "INSERT OR REPLACE INTO" if replace else "INSERT INTO"
+    col_str = ", ".join(columns)
+    val_str = ", ".join(["?"] * len(columns))
+    return f"{verb} {table_name} ({col_str}) VALUES ({val_str})"
+
+
+class FuturesDataStore:
+    """管理 SQLite 資料庫、每小時獨立 SQL/DB 檔案與 CSV 匯出，處理每月最後交易日數據替換及按日統計。"""
+
+    def __init__(self, db_path: str = "hsi_futures.db", restore_oct28: bool = True):
+        self.db_path = db_path
+        self.restore_oct28 = restore_oct28
+        db_dir = os.path.dirname(os.path.abspath(self.db_path))
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        self._init_db()
+        self.sanitize_and_sort_db()
+
+    def _ensure_table_schema(
+        self, conn: sqlite3.Connection, table_name: str, expected_cols: List[str]
+    ) -> None:
+        """檢查現有資料表欄位是否與預期完全一致，若舊表結構不同則自動重建。"""
+        cur = conn.execute(f"PRAGMA table_info({table_name})")
+        existing_cols = [row[1] for row in cur.fetchall()]
+        if existing_cols and existing_cols != expected_cols:
+            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            self._ensure_table_schema(conn, "intervals_15m", COLS_15M)
+            self._ensure_table_schema(conn, "bars_1h", COLS_1H)
+            self._ensure_table_schema(conn, "bars_1h_indicators", COLS_1H_DETAIL)
+            self._ensure_table_schema(conn, "bars_1d", COLS_1D)
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intervals_15m (
+                    timestamp TEXT PRIMARY KEY,
+                    trade_date TEXT NOT NULL,
+                    time_str TEXT NOT NULL,
+                    contract_month TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    trades REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bars_1h (
+                    timestamp TEXT PRIMARY KEY,
+                    trade_date TEXT NOT NULL,
+                    contract_month TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bars_1h_indicators (
+                    timestamp TEXT PRIMARY KEY,
+                    trade_date TEXT NOT NULL,
+                    contract_month TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    sma_50 REAL,
+                    bb_mid REAL,
+                    bb_upper REAL,
+                    bb_lower REAL,
+                    sar REAL,
+                    macd REAL,
+                    macd_signal REAL,
+                    macd_diff REAL,
+                    vol_sma_5 REAL,
+                    stc_sk REAL,
+                    stc_sd REAL,
+                    rsi_9 REAL,
+                    rsi_sma_5 REAL,
+                    rsi_14 REAL,
+                    score_sar INTEGER,
+                    score_bb INTEGER,
+                    score_rsi INTEGER,
+                    score_stc INTEGER,
+                    score_macd INTEGER,
+                    total_score INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bars_1d (
+                    trade_date TEXT PRIMARY KEY,
+                    contract_month TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    def _recover_20261028_and_fix_misdated_rows(self) -> None:
+        """
+        自動修正曾被誤標為 2026-10-28 的 202611 合約早盤記錄，並確保 2026-10-28 的 25 筆完整記錄存在。
+        """
+        if not self.restore_oct28:
+            return
+
+        with sqlite3.connect(self.db_path) as conn:
+            misdated = conn.execute(
+                "SELECT time_str, contract_month, open, high, low, close, volume, trades "
+                "FROM intervals_15m WHERE trade_date = '2026-10-28' AND contract_month = '202611'"
+            ).fetchall()
+
+            if misdated:
+                conn.execute(
+                    "DELETE FROM intervals_15m WHERE trade_date = '2026-10-28' AND contract_month = '202611'"
+                )
+                fixed_rows = [
+                    (f"2026-10-29 {r[0]}:00", "2026-10-29", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7])
+                    for r in misdated
+                ]
+                conn.executemany(
+                    _build_insert_sql("intervals_15m", COLS_15M, replace=True),
+                    fixed_rows,
+                )
+
+            cnt_oct28 = conn.execute(
+                "SELECT COUNT(*) FROM intervals_15m WHERE trade_date = '2026-10-28' AND contract_month = '202610'"
+            ).fetchone()[0]
+            if cnt_oct28 < 25:
+                conn.executemany(
+                    _build_insert_sql("intervals_15m", COLS_15M, replace=True),
+                    RECOVERED_20261028_ROWS,
+                )
+
+            # 自動補回 2026-11-05 (昨日忘記開程式所缺漏的 25 筆完整 15 分鐘時段記錄，源自經濟通即月期貨 202611)
+            cnt_nov05 = conn.execute(
+                "SELECT COUNT(*) FROM intervals_15m WHERE trade_date = '2026-11-05' AND contract_month = '202611'"
+            ).fetchone()[0]
+            if cnt_nov05 < 25:
+                conn.executemany(
+                    _build_insert_sql("intervals_15m", COLS_15M, replace=True),
+                    RECOVERED_20261105_ROWS,
+                )
+                print("[數據補回] 已自動從內置經濟通 (etnet) 即月期貨備份補回 2026-11-05 全日 25 筆 15 分鐘記錄 (合成 6 根小時燭)！")
+
+            # 確保 2026-11-06 早盤至 11:00 的整刻記錄完整
+            cnt_nov06_exact = conn.execute(
+                "SELECT COUNT(*) FROM intervals_15m WHERE trade_date = '2026-11-06' AND contract_month = '202611' "
+                "AND time_str IN ('09:30','09:45','10:00','10:15','10:30','10:45','11:00')"
+            ).fetchone()[0]
+            if cnt_nov06_exact < 7 and today_hkt() >= dt.date(2026, 11, 6):
+                conn.executemany(
+                    _build_insert_sql("intervals_15m", COLS_15M, replace=True),
+                    RECOVERED_20261106_MORNING_ROWS,
+                )
+            conn.commit()
+
+    def sanitize_and_sort_db(self) -> None:
+        """
+        自動修復及重排現有資料庫內的 intervals_15m，並重新合成跨日連接的 bars_1h、bars_1h_indicators 與 bars_1d。
+        """
+        self._recover_20261028_and_fix_misdated_rows()
+
+        with sqlite3.connect(self.db_path) as conn:
+            df_existing = pd.read_sql_query("SELECT * FROM intervals_15m", conn)
+
+        if df_existing.empty:
+            return
+
+        df_clean = deduplicate_and_sort_15m_df(df_existing)
+        df_clean["timestamp"] = pd.to_datetime(df_clean["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        rows_15m = df_clean[COLS_15M].values.tolist()
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM intervals_15m")
+            conn.executemany(_build_insert_sql("intervals_15m", COLS_15M, replace=False), rows_15m)
+            conn.commit()
+
+        self.rebuild_hourly_and_daily_bars()
+
+    def save_interval_data(
+        self,
+        df_15m: pd.DataFrame,
+        is_last_trading_day_rollover: bool = False,
+        rollover_rule: str = "hkex",
+    ) -> None:
+        """
+        儲存 15 分鐘時段數據，並確保按時間順序排列與清理臨時分鐘列。
+        僅當某交易日 (t_date) 本身已達該月最後交易日時，才清除該日舊合約數據，絕不影響前一日數據！
+        """
+        if df_15m.empty:
+            return
+
+        df_save = df_15m.copy()
+        df_save["timestamp"] = pd.to_datetime(df_save["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        holidays = get_hk_holidays_set()
+
+        with sqlite3.connect(self.db_path) as conn:
+            if is_last_trading_day_rollover:
+                for t_date in df_save["trade_date"].unique():
+                    t_date_obj = dt.date.fromisoformat(str(t_date))
+                    last_td_for_date = get_last_trading_day(
+                        t_date_obj.year, t_date_obj.month, rule=rollover_rule, holidays=holidays
+                    )
+                    if t_date_obj >= last_td_for_date:
+                        new_month = df_save.loc[df_save["trade_date"] == t_date, "contract_month"].iloc[0]
+                        conn.execute(
+                            "DELETE FROM intervals_15m WHERE trade_date = ? AND contract_month != ?",
+                            (t_date, new_month),
+                        )
+                        conn.execute(
+                            "DELETE FROM bars_1h WHERE trade_date = ? AND contract_month != ?",
+                            (t_date, new_month),
+                        )
+                        conn.execute(
+                            "DELETE FROM bars_1h_indicators WHERE trade_date = ? AND contract_month != ?",
+                            (t_date, new_month),
+                        )
+                        conn.execute(
+                            "DELETE FROM bars_1d WHERE trade_date = ? AND contract_month != ?",
+                            (t_date, new_month),
+                        )
+
+            rows = df_save[COLS_15M].values.tolist()
+            conn.executemany(_build_insert_sql("intervals_15m", COLS_15M, replace=True), rows)
+            conn.commit()
+
+        self.sanitize_and_sort_db()
+
+    def sync_from_github_db(
+        self,
+        github_db_url: Optional[str] = None,
+        github_token: Optional[str] = None,
+        timeout: int = 25,
+    ) -> int:
+        """
+        從 GitHub Actions 自動更新的遠端 hsi_futures.db 下載並無縫合併 (INSERT OR REPLACE)
+        所有 15 分鐘時段記錄與歷史日線記錄至本地 / Google Drive 資料庫。
+        回傳遠端資料庫的 15 分鐘記錄筆數。
+        """
+        url = (github_db_url or DEFAULT_GITHUB_RAW_DB_URL or "").strip()
+        if not url:
+            return 0
+
+        import tempfile
+        headers = dict(DEFAULT_HEADERS)
+        token = (github_token or os.environ.get("GITHUB_TOKEN", "")).strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        print(f"[GitHub 同步] 正在從 GitHub 雲端資料庫拉取最新累積數據: {url}")
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_f:
+                tmp_f.write(resp.content)
+                tmp_path = tmp_f.name
+
+            try:
+                with sqlite3.connect(tmp_path) as r_conn:
+                    df_remote_15m = pd.read_sql_query("SELECT * FROM intervals_15m", r_conn)
+                    try:
+                        df_remote_1d = pd.read_sql_query("SELECT * FROM bars_1d", r_conn)
+                    except Exception:
+                        df_remote_1d = pd.DataFrame()
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+            if df_remote_1d is not None and not df_remote_1d.empty and set(COLS_1D).issubset(df_remote_1d.columns):
+                self.save_historical_daily_bars(df_remote_1d[COLS_1D])
+
+            if df_remote_15m is not None and not df_remote_15m.empty and set(COLS_15M).issubset(df_remote_15m.columns):
+                before_cnt = len(self.load_intervals_15m())
+                self.save_interval_data(
+                    df_remote_15m[COLS_15M],
+                    is_last_trading_day_rollover=False,
+                )
+                after_cnt = len(self.load_intervals_15m())
+                added = max(0, after_cnt - before_cnt)
+                print(
+                    f"[GitHub 同步] 成功合併 GitHub 雲端資料庫 (遠端共 {len(df_remote_15m)} 筆，"
+                    f"本地新增 {added} 筆，目前總計 {after_cnt} 筆 15 分鐘記錄)！"
+                )
+                return len(df_remote_15m)
+        except Exception as exc:
+            print(f"[警告] 從 GitHub 同步資料庫失敗 ({exc})，繼續使用本地資料庫。")
+        return 0
+
+    def save_historical_daily_bars(self, df_daily: pd.DataFrame) -> None:
+        """儲存或匯入按日統計歷史 K 線數據 (供計算 20 / 50 / 250 日均線使用)。"""
+        if df_daily.empty:
+            return
+        df_sorted = df_daily.sort_values("trade_date").reset_index(drop=True)
+        rows = df_sorted[COLS_1D].values.tolist()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(_build_insert_sql("bars_1d", COLS_1D, replace=True), rows)
+            conn.commit()
+
+    def rebuild_hourly_and_daily_bars(self) -> pd.DataFrame:
+        """
+        1. 對照經濟通 (etnet) 小時圖時段 (10:00, 11:00, 12:00, 14:00, 15:00, 16:00)
+           將所有已儲存交易日的 15 分鐘數據整合成跨日連續的 1 小時 K 線 (bars_1h)，
+           同時計算全套指標與評分存入 bars_1h_indicators。
+        2. 按交易日 (trade_date) 統計每日開高低收與總成交量，更新至日線表 (bars_1d)。
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            df_15m = pd.read_sql_query(
+                "SELECT * FROM intervals_15m ORDER BY timestamp ASC", conn
+            )
+
+        if df_15m.empty:
+            return self.load_hourly_bars()
+
+        df_15m["dt"] = pd.to_datetime(df_15m["timestamp"])
+        df_15m["hour_bucket"] = df_15m["dt"].apply(map_to_etnet_hourly_bucket)
+
+        grouped_1h = (
+            df_15m.sort_values("dt")
+            .groupby("hour_bucket", as_index=False)
+            .agg(
+                trade_date=("trade_date", "last"),
+                contract_month=("contract_month", "last"),
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                volume=("volume", "sum"),
+            )
+            .sort_values("hour_bucket")
+            .reset_index(drop=True)
+        )
+        grouped_1h["timestamp"] = grouped_1h["hour_bucket"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        rows_1h = grouped_1h[COLS_1H].values.tolist()
+
+        # 計算每小時技術指標與 (+1 / -1) 評分
+        df_1h_for_ind = grouped_1h.copy()
+        df_1h_for_ind["timestamp"] = pd.to_datetime(df_1h_for_ind["timestamp"])
+        df_1h_ind = compute_all_indicators(df_1h_for_ind)
+        df_1h_ind["timestamp"] = df_1h_ind["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        for col in [
+            "sma_50", "bb_mid", "bb_upper", "bb_lower", "sar",
+            "macd", "macd_signal", "macd_diff", "vol_sma_5",
+            "stc_sk", "stc_sd", "rsi_9", "rsi_sma_5", "rsi_14",
+        ]:
+            df_1h_ind[col] = df_1h_ind[col].round(2)
+        rows_1h_detail = df_1h_ind[COLS_1H_DETAIL].values.tolist()
+
+        grouped_1d = (
+            df_15m.sort_values("dt")
+            .groupby("trade_date", as_index=False)
+            .agg(
+                contract_month=("contract_month", "last"),
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                volume=("volume", "sum"),
+            )
+            .sort_values("trade_date")
+            .reset_index(drop=True)
+        )
+        rows_1d = grouped_1d[COLS_1D].values.tolist()
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM bars_1h")
+            conn.executemany(_build_insert_sql("bars_1h", COLS_1H, replace=True), rows_1h)
+            conn.execute("DELETE FROM bars_1h_indicators")
+            conn.executemany(_build_insert_sql("bars_1h_indicators", COLS_1H_DETAIL, replace=True), rows_1h_detail)
+            conn.executemany(_build_insert_sql("bars_1d", COLS_1D, replace=True), rows_1d)
+            conn.commit()
+
+        return self.load_hourly_bars()
+
+    def export_hourly_sql_and_db(
+        self, output_dir: str = ".", prefix: str = "hsi_futures"
+    ) -> Tuple[str, str]:
+        """
+        另行生成每小時數據專用的兩個檢查檔案:
+        1. 獨立 SQLite 資料庫檔案: hsi_futures_1h.db (內含 hourly_bars 與 hourly_indicators 兩張表，可直接用 SQLite 檢視器開啟)
+        2. 標準 SQL 語句檔案: hsi_futures_1h.sql (純文字 SQL CREATE + INSERT 語句，可用任何文字編輯器或資料庫工具開啟核對)
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            df_1h = pd.read_sql_query("SELECT * FROM bars_1h ORDER BY timestamp ASC", conn)
+            df_1h_ind = pd.read_sql_query(
+                "SELECT * FROM bars_1h_indicators ORDER BY timestamp ASC", conn
+            )
+
+        hourly_db_path = os.path.join(output_dir, f"{prefix}_1h.db")
+        hourly_sql_path = os.path.join(output_dir, f"{prefix}_1h.sql")
+
+        if os.path.exists(hourly_db_path):
+            os.remove(hourly_db_path)
+
+        with sqlite3.connect(hourly_db_path) as h_conn:
+            h_conn.execute(
+                """
+                CREATE TABLE hourly_bars (
+                    timestamp TEXT PRIMARY KEY,
+                    trade_date TEXT NOT NULL,
+                    contract_month TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL
+                )
+                """
+            )
+            h_conn.execute(
+                """
+                CREATE TABLE hourly_indicators (
+                    timestamp TEXT PRIMARY KEY,
+                    trade_date TEXT NOT NULL,
+                    contract_month TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    sma_50 REAL,
+                    bb_mid REAL,
+                    bb_upper REAL,
+                    bb_lower REAL,
+                    sar REAL,
+                    macd REAL,
+                    macd_signal REAL,
+                    macd_diff REAL,
+                    vol_sma_5 REAL,
+                    stc_sk REAL,
+                    stc_sd REAL,
+                    rsi_9 REAL,
+                    rsi_sma_5 REAL,
+                    rsi_14 REAL,
+                    score_sar INTEGER,
+                    score_bb INTEGER,
+                    score_rsi INTEGER,
+                    score_stc INTEGER,
+                    score_macd INTEGER,
+                    total_score INTEGER
+                )
+                """
+            )
+            if not df_1h.empty:
+                h_conn.executemany(
+                    _build_insert_sql("hourly_bars", COLS_1H, replace=True),
+                    df_1h[COLS_1H].values.tolist(),
+                )
+            if not df_1h_ind.empty:
+                h_conn.executemany(
+                    _build_insert_sql("hourly_indicators", COLS_1H_DETAIL, replace=True),
+                    df_1h_ind[COLS_1H_DETAIL].values.tolist(),
+                )
+            h_conn.commit()
+
+            with open(hourly_sql_path, "w", encoding="utf-8") as f:
+                f.write("-- 恒生指數期貨 (HSI Futures) 每小時 K 線與技術指標檢查 SQL 檔\n")
+                f.write(f"-- 生成時間 (HKT): {now_hkt().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                for line in h_conn.iterdump():
+                    f.write(f"{line}\n")
+
+        return hourly_db_path, hourly_sql_path
+
+    def load_intervals_15m(self) -> pd.DataFrame:
+        with sqlite3.connect(self.db_path) as conn:
+            df_15m = pd.read_sql_query("SELECT * FROM intervals_15m ORDER BY timestamp ASC", conn)
+        return df_15m
+
+    def load_hourly_bars(self) -> pd.DataFrame:
+        with sqlite3.connect(self.db_path) as conn:
+            df_1h = pd.read_sql_query("SELECT * FROM bars_1h ORDER BY timestamp ASC", conn)
+        if not df_1h.empty:
+            df_1h["timestamp"] = pd.to_datetime(df_1h["timestamp"])
+        return df_1h
+
+    def load_daily_bars(self) -> pd.DataFrame:
+        with sqlite3.connect(self.db_path) as conn:
+            df_1d = pd.read_sql_query("SELECT * FROM bars_1d ORDER BY trade_date ASC", conn)
+        return df_1d
+
+    def export_csv(self, output_dir: str = ".", prefix: str = "hsi_futures") -> Tuple[str, str, str]:
+        """將資料庫內的 15 分鐘、1 小時(含全套指標與評分)與按日統計數據匯出為 CSV 檔案。"""
+        os.makedirs(output_dir, exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            df_15m = pd.read_sql_query("SELECT * FROM intervals_15m ORDER BY timestamp ASC", conn)
+            df_1h_ind = pd.read_sql_query(
+                "SELECT * FROM bars_1h_indicators ORDER BY timestamp ASC", conn
+            )
+            df_1d = pd.read_sql_query("SELECT * FROM bars_1d ORDER BY trade_date ASC", conn)
+
+        path_15m = os.path.join(output_dir, f"{prefix}_15m.csv")
+        path_1h = os.path.join(output_dir, f"{prefix}_1h.csv")
+        path_1d = os.path.join(output_dir, f"{prefix}_1d.csv")
+        df_15m.to_csv(path_15m, index=False, encoding="utf-8-sig")
+        df_1h_ind.to_csv(path_1h, index=False, encoding="utf-8-sig")
+        df_1d.to_csv(path_1d, index=False, encoding="utf-8-sig")
+        return path_15m, path_1h, path_1d
+
+
+# =====================================================================
+# 6. 圖表繪製 (支援 Matplotlib 高清圖表 + 互動式 HTML 圖表 + Colab 自動顯示)
+# =====================================================================
+
+def _configure_cjk_font() -> None:
+    """自動偵測並註冊系統中文字型（若在 Google Colab 缺少中文字型則自動安裝）。"""
+    candidate_paths = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    ]
+    if is_running_in_colab() and not any(os.path.exists(p) for p in candidate_paths):
+        try:
+            print("[Colab] 正在自動安裝繁體中文字型 (fonts-noto-cjk)...")
+            subprocess.run(
+                ["apt-get", "update", "-qq"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            subprocess.run(
+                ["apt-get", "install", "-y", "-qq", "fonts-noto-cjk"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    for p in candidate_paths:
+        if os.path.exists(p):
+            try:
+                font_manager.fontManager.addfont(p)
+            except Exception:
+                pass
+
+    plt.rcParams["font.sans-serif"] = [
+        "Noto Sans CJK TC",
+        "Noto Sans CJK HK",
+        "Noto Sans CJK JP",
+        "Noto Sans CJK SC",
+        "Microsoft JhengHei",
+        "PingFang HK",
+        "SimHei",
+        "Droid Sans Fallback",
+        "DejaVu Sans",
+    ]
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+def _fmt_score(val: int) -> str:
+    return f"+{int(val)}" if int(val) > 0 else f"{int(val)}"
+
+
+def plot_static_chart(
+    df: pd.DataFrame,
+    daily_sma_levels: Optional[Dict[int, Optional[float]]] = None,
+    output_png: str = "hsi_futures_chart.png",
+    title_prefix: str = "HSI 恒生指數期貨 (小時圖)",
+    timeframe: str = "1h",
+    max_bars: Optional[int] = None,
+) -> str:
+    """
+    依據圖片技術指標參數繪製 5 層技術分析圖表及 (+1 / -1) 指標評分標示 (支援小時圖與 15 分鐘圖):
+    - Panel 0 (主圖): 陰陽燭 + 1.SAR(0.02, 0.20) + 2.保歷加通道(20, 2)中軸線 + 50時段均線
+                     + (當日線數據足夠時) 按日統計 20 / 50 / 250 時段平均線橫線
+    - Panel 1: 5.MACD (12, 26, 9) — 標示 Difference (差離值 / 柱狀圖數值) 及 (+1/-1) 評分
+    - Panel 2: 4.STC 慢版隨機指標 (%K = 18 藍線, %D = 5 紅線) 及 (+1/-1) 評分
+    - Panel 3: 3.RSI 相對強弱指數 (期指必用 9 RSI + 5 時段平均線，另附 14 RSI 虛線參考) 及 (+1/-1) 評分
+    - Panel 4 (最底層): VOL 成交量 + 5-SMA (依用戶要求放於技術指標最底部)
+    """
+    _configure_cjk_font()
+    if daily_sma_levels is None:
+        daily_sma_levels = {20: None, 50: None, 250: None}
+
+    plot_df = df.copy().reset_index(drop=True)
+    if max_bars is not None and len(plot_df) > max_bars:
+        plot_df = plot_df.tail(max_bars).reset_index(drop=True)
+
+    n = len(plot_df)
+    x = np.arange(n)
+
+    COLOR_UP = "#cc0000"      # 陽燭 / 上升 (紅)
+    COLOR_DOWN = "#0055aa"    # 陰燭 / 下跌 (藍)
+    COLOR_SMA50 = "#ff8c00"   # 50時段均線 (橙)
+    COLOR_BB = "#7b68ee"      # 保歷加通道 (紫藍)
+
+    DAILY_LINE_STYLES = {
+        20: ("#008b8b", "-.", "按日 20-SMA 橫線"),
+        50: ("#8b008b", "--", "按日 50-SMA 橫線"),
+        250: ("#2e8b57", "-", "按日 250-SMA 橫線"),
+    }
+
+    fig = plt.figure(figsize=(16, 13.2), dpi=150, facecolor="white")
+    gs = fig.add_gridspec(
+        nrows=5,
+        ncols=1,
+        height_ratios=[4.6, 1.35, 1.25, 1.25, 1.25],
+        hspace=0.08,
+    )
+
+    ax_main = fig.add_subplot(gs[0])
+    ax_macd = fig.add_subplot(gs[1], sharex=ax_main)
+    ax_stc = fig.add_subplot(gs[2], sharex=ax_main)
+    ax_rsi = fig.add_subplot(gs[3], sharex=ax_main)
+    ax_vol = fig.add_subplot(gs[4], sharex=ax_main)  # 成交量放在技術指標最底層
+
+    last = plot_df.iloc[-1]
+
+    # -------------------- 主圖: 陰陽燭 + BB(20,2)看中軸線 + SMA(50) + SAR --------------------
+    candle_width = 0.58 if n > 12 else 0.42
+    for i in range(n):
+        o = plot_df.loc[i, "open"]
+        h = plot_df.loc[i, "high"]
+        l = plot_df.loc[i, "low"]
+        c = plot_df.loc[i, "close"]
+        is_up = c >= o
+        color = COLOR_UP if is_up else COLOR_DOWN
+
+        ax_main.plot([i, i], [l, h], color=color, linewidth=1.1, zorder=2)
+
+        lower = min(o, c)
+        height = max(abs(c - o), 1.5)
+        rect = Rectangle(
+            (i - candle_width / 2, lower),
+            candle_width,
+            height,
+            edgecolor=color,
+            facecolor="white" if is_up else color,
+            linewidth=1.15,
+            zorder=3,
+        )
+        ax_main.add_patch(rect)
+
+    # 2. 保歷加通道 BB(20, 2) — 突顯中軸線並標示 (+1/-1)
+    ax_main.plot(
+        x,
+        plot_df["bb_mid"],
+        color=COLOR_BB,
+        linestyle="-",
+        linewidth=1.4,
+        alpha=0.9,
+        label=f"BB 中軸 (20): {last['bb_mid']:,.0f} [{_fmt_score(last['score_bb'])}]",
+    )
+    ax_main.plot(
+        x, plot_df["bb_upper"], color=COLOR_BB, linestyle="--", linewidth=0.95, alpha=0.75, label="BB 上軸 (20,2)"
+    )
+    ax_main.plot(
+        x, plot_df["bb_lower"], color=COLOR_BB, linestyle="--", linewidth=0.95, alpha=0.75, label="BB 下軸 (20,2)"
+    )
+    ax_main.fill_between(x, plot_df["bb_lower"], plot_df["bb_upper"], color=COLOR_BB, alpha=0.06)
+
+    # 50 時段平均線
+    ax_main.plot(
+        x, plot_df["sma_50"], color=COLOR_SMA50, linewidth=1.6, label=f"50時段均線: {last['sma_50']:,.0f}"
+    )
+
+    # 1. SAR (0.02, 0.20) 轉向點並標示 (+1/-1)
+    up_sar = plot_df["sar_trend"] == 1
+    dn_sar = plot_df["sar_trend"] == -1
+    sar_pt_size = 12 if timeframe == "15m" else 15
+    ax_main.scatter(
+        x[up_sar],
+        plot_df.loc[up_sar, "sar"],
+        color=COLOR_DOWN,
+        s=sar_pt_size,
+        marker="s",
+        label=f"SAR (0.02, 0.20): {last['sar']:,.0f} [{_fmt_score(last['score_sar'])}]",
+        zorder=4,
+    )
+    ax_main.scatter(
+        x[dn_sar],
+        plot_df.loc[dn_sar, "sar"],
+        color=COLOR_UP,
+        s=sar_pt_size,
+        marker="s",
+        label="SAR 跌勢阻力",
+        zorder=4,
+    )
+
+    # -------------------- 按日統計 20 / 50 / 250 時段平均線橫線 --------------------
+    plotted_daily_values = []
+    for period in (20, 50, 250):
+        lvl = daily_sma_levels.get(period)
+        if lvl is not None and not np.isnan(lvl):
+            c_line, ls_line, lbl_prefix = DAILY_LINE_STYLES[period]
+            ax_main.axhline(
+                y=lvl,
+                color=c_line,
+                linestyle=ls_line,
+                linewidth=1.5,
+                alpha=0.92,
+                label=f"{lbl_prefix}: {lvl:,.1f}",
+                zorder=3.5,
+            )
+            ax_main.annotate(
+                f"日{period}MA: {lvl:,.0f}",
+                xy=(n - 1, lvl),
+                xytext=(-4, 3),
+                textcoords="offset points",
+                ha="right",
+                va="bottom",
+                fontsize=8,
+                fontweight="bold",
+                color=c_line,
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=c_line, alpha=0.88, lw=0.8),
+                zorder=5,
+            )
+            plotted_daily_values.append(lvl)
+
+    # 標示區間最高價與最低價
+    max_idx = int(plot_df["high"].idxmax())
+    min_idx = int(plot_df["low"].idxmin())
+    ax_main.annotate(
+        f"{plot_df.loc[max_idx, 'high']:,.2f}",
+        xy=(max_idx, plot_df.loc[max_idx, "high"]),
+        xytext=(0, 7),
+        textcoords="offset points",
+        ha="center",
+        fontsize=8.5,
+        color="white",
+        bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="none"),
+        zorder=6,
+    )
+    ax_main.annotate(
+        f"{plot_df.loc[min_idx, 'low']:,.2f}",
+        xy=(min_idx, plot_df.loc[min_idx, "low"]),
+        xytext=(0, -14),
+        textcoords="offset points",
+        ha="center",
+        fontsize=8.5,
+        color="white",
+        bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="none"),
+        zorder=6,
+    )
+
+    y_candidates_min = [float(plot_df["low"].min()), float(plot_df["bb_lower"].min()), float(plot_df["sar"].min())]
+    y_candidates_max = [float(plot_df["high"].max()), float(plot_df["bb_upper"].max()), float(plot_df["sar"].max())]
+    if plotted_daily_values:
+        y_candidates_min.extend(plotted_daily_values)
+        y_candidates_max.extend(plotted_daily_values)
+
+    y_min = min(y_candidates_min)
+    y_max = max(y_candidates_max)
+    y_span = max(y_max - y_min, 80.0)
+    ax_main.set_ylim(y_min - 0.10 * y_span, y_max + 0.24 * y_span)
+
+    start_str = plot_df["timestamp"].iloc[0].strftime("%d/%m/%Y")
+    end_str = plot_df["timestamp"].iloc[-1].strftime("%d/%m/%Y")
+    header_info = (
+        f"由 {start_str} 到 {end_str}  |  {title_prefix} (合約: {last['contract_month']})  "
+        f"{last['timestamp'].strftime('%H:%M')}  "
+        f"O:{last['open']:,.0f} H:{last['high']:,.0f} L:{last['low']:,.0f} C:{last['close']:,.0f}  |  "
+        f"五項指標總分: {_fmt_score(last['total_score'])} / 5 "
+        f"(SAR:{_fmt_score(last['score_sar'])} BB中軸:{_fmt_score(last['score_bb'])} "
+        f"9RSI:{_fmt_score(last['score_rsi'])} STC:{_fmt_score(last['score_stc'])} MACD:{_fmt_score(last['score_macd'])})"
+    )
+    ax_main.set_title(header_info, loc="left", fontsize=9.8, fontweight="bold", pad=8, color="#003366")
+    ax_main.legend(loc="upper right", ncol=3, fontsize=7.8, framealpha=0.92)
+    ax_main.set_ylabel("指數點數", fontsize=9)
+
+    # -------------------- 副圖 1 (gs[1]): 5. MACD (12, 26, 9) 只看 Difference --------------------
+    diff_colors = [COLOR_UP if v >= 0 else COLOR_DOWN for v in plot_df["macd_diff"]]
+    ax_macd.bar(
+        x,
+        plot_df["macd_diff"],
+        width=candle_width,
+        color=diff_colors,
+        alpha=0.8,
+        label=f"Difference (柱狀圖): {last['macd_diff']:.2f} [{_fmt_score(last['score_macd'])}]",
+    )
+    ax_macd.plot(x, plot_df["macd"], color=COLOR_DOWN, linewidth=1.2, label=f"MACD(12,26): {last['macd']:.2f}")
+    ax_macd.plot(
+        x, plot_df["macd_signal"], color=COLOR_UP, linewidth=1.2, label=f"9-EMA: {last['macd_signal']:.2f}"
+    )
+    ax_macd.axhline(0, color="#999999", linewidth=0.7, linestyle="--")
+    m_min = float(min(plot_df["macd"].min(), plot_df["macd_signal"].min(), plot_df["macd_diff"].min()))
+    m_max = float(max(plot_df["macd"].max(), plot_df["macd_signal"].max(), plot_df["macd_diff"].max()))
+    m_span = max(m_max - m_min, 5.0)
+    ax_macd.set_ylim(m_min - 0.12 * m_span, m_max + 0.28 * m_span)
+    ax_macd.set_ylabel("MACD", fontsize=8.5)
+    ax_macd.legend(loc="upper left", ncol=3, fontsize=8, frameon=False)
+
+    # -------------------- 副圖 2 (gs[2]): 4. STC 慢版隨機指標 (%K=18, %D=5) --------------------
+    ax_stc.plot(
+        x,
+        plot_df["stc_sk"],
+        color=COLOR_DOWN,
+        linewidth=1.25,
+        label=f"藍線 %K (18): {last['stc_sk']:.2f} [{_fmt_score(last['score_stc'])}]",
+    )
+    ax_stc.plot(
+        x,
+        plot_df["stc_sd"],
+        color=COLOR_UP,
+        linewidth=1.25,
+        label=f"紅線 %D (5): {last['stc_sd']:.2f}",
+    )
+    ax_stc.axhline(80, color="#cccccc", linewidth=0.8, linestyle="--")
+    ax_stc.axhline(20, color="#cccccc", linewidth=0.8, linestyle="--")
+    ax_stc.set_ylim(0, 112)
+    ax_stc.set_yticks([0, 20, 50, 80, 100])
+    ax_stc.set_ylabel("Slow STC", fontsize=8.5)
+    ax_stc.legend(loc="upper left", ncol=2, fontsize=8, frameon=False)
+
+    # -------------------- 副圖 3 (gs[3]): 3. RSI 相對強弱指數 (9 RSI + 5 時段平均線) --------------------
+    ax_rsi.plot(
+        x,
+        plot_df["rsi_9"],
+        color=COLOR_DOWN,
+        linewidth=1.25,
+        label=f"9 RSI: {last['rsi_9']:.2f} [{_fmt_score(last['score_rsi'])}]",
+    )
+    ax_rsi.plot(
+        x,
+        plot_df["rsi_sma_5"],
+        color=COLOR_UP,
+        linewidth=1.25,
+        label=f"5時段平均線 (5-SMA): {last['rsi_sma_5']:.2f}",
+    )
+    ax_rsi.plot(
+        x,
+        plot_df["rsi_14"],
+        color="#888888",
+        linewidth=0.9,
+        linestyle=":",
+        alpha=0.8,
+        label=f"14 RSI (參考): {last['rsi_14']:.2f}",
+    )
+    ax_rsi.axhline(70, color="#cccccc", linewidth=0.8, linestyle="--")
+    ax_rsi.axhline(30, color="#cccccc", linewidth=0.8, linestyle="--")
+    ax_rsi.set_ylim(0, 112)
+    ax_rsi.set_yticks([0, 30, 50, 70, 100])
+    ax_rsi.set_ylabel("9 RSI", fontsize=8.5)
+    ax_rsi.legend(loc="upper left", ncol=3, fontsize=8, frameon=False)
+
+    # -------------------- 副圖 4 (gs[4] 最底層): VOL 成交量 + 5-SMA --------------------
+    vol_colors = [COLOR_UP if plot_df.loc[i, "close"] >= plot_df.loc[i, "open"] else COLOR_DOWN for i in range(n)]
+    ax_vol.bar(
+        x, plot_df["volume"], width=candle_width, color=vol_colors, alpha=0.85, label=f"VOL: {last['volume']:,.0f}"
+    )
+    ax_vol.plot(
+        x, plot_df["vol_sma_5"], color="#669900", linewidth=1.3, label=f"5-SMA: {last['vol_sma_5']:,.0f}"
+    )
+    ax_vol.set_ylim(0, float(plot_df["volume"].max()) * 1.25)
+    ax_vol.set_ylabel("成交量", fontsize=8.5)
+    ax_vol.legend(loc="upper left", ncol=2, fontsize=8, frameon=False)
+
+    # -------------------- X 軸日期分隔格線與時段標籤 (標示於最底層成交量面板下方) --------------------
+    if timeframe == "15m":
+        step_t = max(1, n // 12)
+        tick_indices = list(range(0, n, step_t))
+        if n > 0 and (n - 1) not in tick_indices:
+            if len(tick_indices) > 1 and (n - 1 - tick_indices[-1]) < max(1, step_t // 2):
+                tick_indices[-1] = n - 1
+            else:
+                tick_indices.append(n - 1)
+        tick_labels = []
+        prev_d = None
+        for idx_t in tick_indices:
+            cur_dt = plot_df.loc[idx_t, "timestamp"]
+            if cur_dt.date() != prev_d:
+                tick_labels.append(cur_dt.strftime("%m/%d\n%H:%M"))
+                prev_d = cur_dt.date()
+            else:
+                tick_labels.append(cur_dt.strftime("%H:%M"))
+    else:
+        if n <= 18:
+            tick_indices = list(range(n))
+            tick_labels = []
+            prev_date = None
+            for i in range(n):
+                cur_dt = plot_df.loc[i, "timestamp"]
+                if cur_dt.date() != prev_date:
+                    tick_labels.append(cur_dt.strftime("%-d %b\n%H:%M"))
+                    prev_date = cur_dt.date()
+                else:
+                    tick_labels.append(cur_dt.strftime("%H:%M"))
+        else:
+            tick_indices = []
+            tick_labels = []
+            prev_date = None
+            for i in range(n):
+                cur_date = plot_df.loc[i, "timestamp"].date()
+                if cur_date != prev_date:
+                    tick_indices.append(i)
+                    tick_labels.append(plot_df.loc[i, "timestamp"].strftime("%-d %b"))
+                    prev_date = cur_date
+
+            if n > 0 and (n - 1) not in tick_indices:
+                tick_indices.append(n - 1)
+                tick_labels.append(plot_df.loc[n - 1, "timestamp"].strftime("%H:%M"))
+
+    for ax in [ax_main, ax_macd, ax_stc, ax_rsi, ax_vol]:
+        ax.yaxis.tick_right()
+        ax.yaxis.set_label_position("left")
+        ax.set_xticks(tick_indices)
+        ax.grid(True, linestyle="-", linewidth=0.45, color="#e2e2e2")
+        ax.set_xlim(-0.8, n - 0.2)
+
+    for ax in [ax_main, ax_macd, ax_stc, ax_rsi]:
+        plt.setp(ax.get_xticklabels(), visible=False)
+
+    ax_vol.set_xticklabels(tick_labels, fontsize=8.3, color="#555555")
+
+    out_dir = os.path.dirname(os.path.abspath(output_png))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(output_png, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    print(f"[圖表] 已輸出靜態高清技術分析圖表 ({title_prefix}): {output_png}")
+
+    if "ipykernel" in sys.modules or is_running_in_colab():
+        try:
+            from IPython.display import Image, display
+            display(Image(filename=output_png))
+        except Exception:
+            pass
+
+    return output_png
+
+
+def export_interactive_html_chart(
+    df: pd.DataFrame,
+    daily_sma_levels: Optional[Dict[int, Optional[float]]] = None,
+    output_html: str = "hsi_futures_chart.html",
+    title_prefix: str = "HSI 恒生指數期貨 (小時圖)",
+) -> str:
+    """
+    輸出自包含互動式 HTML 圖表 (使用 Apache ECharts CDN)，
+    包含陰陽燭、MACD Diff、Slow STC(18,5)、9 RSI + 5-SMA，並將 VOL 成交量置於最底層。
+    """
+    if daily_sma_levels is None:
+        daily_sma_levels = {20: None, 50: None, 250: None}
+
+    records = []
+    for _, row in df.iterrows():
+        records.append(
+            {
+                "ts": row["timestamp"].strftime("%Y-%m-%d %H:%M"),
+                "month": str(row["contract_month"]),
+                "open": round(float(row["open"]), 1),
+                "high": round(float(row["high"]), 1),
+                "low": round(float(row["low"]), 1),
+                "close": round(float(row["close"]), 1),
+                "vol": int(row["volume"]),
+                "sma50": round(float(row["sma_50"]), 1),
+                "bb_u": round(float(row["bb_upper"]), 1),
+                "bb_m": round(float(row["bb_mid"]), 1),
+                "bb_l": round(float(row["bb_lower"]), 1),
+                "sar": round(float(row["sar"]), 1),
+                "macd": round(float(row["macd"]), 2),
+                "macd_sig": round(float(row["macd_signal"]), 2),
+                "macd_diff": round(float(row["macd_diff"]), 2),
+                "vol_sma5": round(float(row["vol_sma_5"]), 0),
+                "stc_sk": round(float(row["stc_sk"]), 2),
+                "stc_sd": round(float(row["stc_sd"]), 2),
+                "rsi9": round(float(row["rsi_9"]), 2),
+                "rsi_sma5": round(float(row["rsi_sma_5"]), 2),
+                "rsi14": round(float(row["rsi_14"]), 2),
+                "total_score": int(row["total_score"]),
+            }
+        )
+
+    mark_lines = []
+    color_map = {20: "#008b8b", 50: "#8b008b", 250: "#2e8b57"}
+    for period in (20, 50, 250):
+        val = daily_sma_levels.get(period)
+        if val is not None and not np.isnan(val):
+            mark_lines.append(
+                {
+                    "name": f"按日 {period}-SMA",
+                    "yAxis": round(float(val), 1),
+                    "lineStyle": {"color": color_map[period], "width": 1.6, "type": "dashed"},
+                    "label": {"formatter": f"按日 {period}-SMA: {{c}}", "position": "insideEndTop"},
+                }
+            )
+
+    data_json = json.dumps(records, ensure_ascii=False)
+    mark_lines_json = json.dumps(mark_lines, ensure_ascii=False)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{title_prefix} 技術分析工具</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+  <style>
+    body {{ margin: 0; padding: 12px; font-family: "Microsoft JhengHei", "PingFang HK", sans-serif; background: #f5f7fa; }}
+    .card {{ background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 14px; }}
+    #chart {{ width: 100%; height: 900px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="chart"></div>
+  </div>
+  <script>
+    const rawData = {data_json};
+    const dailyMarkLines = {mark_lines_json};
+    const dates = rawData.map(d => d.ts);
+    const ohlc = rawData.map(d => [d.open, d.close, d.low, d.high]);
+    const sma50 = rawData.map(d => d.sma50);
+    const bbU = rawData.map(d => d.bb_u);
+    const bbM = rawData.map(d => d.bb_m);
+    const bbL = rawData.map(d => d.bb_l);
+    const sar = rawData.map(d => d.sar);
+    const macd = rawData.map(d => d.macd);
+    const macdSig = rawData.map(d => d.macd_sig);
+    const macdDiff = rawData.map(d => d.macd_diff);
+    const vols = rawData.map(d => ({{
+      value: d.vol,
+      itemStyle: {{ color: d.close >= d.open ? '#cc0000' : '#0055aa' }}
+    }}));
+    const volSma5 = rawData.map(d => d.vol_sma5);
+    const stcSk = rawData.map(d => d.stc_sk);
+    const stcSd = rawData.map(d => d.stc_sd);
+    const rsi9 = rawData.map(d => d.rsi9);
+    const rsiSma5 = rawData.map(d => d.rsi_sma5);
+    const rsi14 = rawData.map(d => d.rsi14);
+
+    const chart = echarts.init(document.getElementById('chart'));
+    const option = {{
+      title: {{ text: '{title_prefix} — SAR + BB(20,2)中軸 + MACD Diff + Slow STC(18,5) + 9 RSI + VOL(最底層)', left: 10, textStyle: {{ fontSize: 14, color: '#003366' }} }},
+      tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'cross' }} }},
+      axisPointer: {{ link: [{{ xAxisIndex: 'all' }}] }},
+      legend: {{ top: 28, data: ['陰陽燭', '50-SMA', 'BB 中軸(20)', 'BB Upper(20,2)', 'BB Lower(20,2)', 'SAR(0.02,0.20)'] }},
+      grid: [
+        {{ left: 60, right: 65, top: 65, height: '36%' }},
+        {{ left: 60, right: 65, top: '46%', height: '11%' }},
+        {{ left: 60, right: 65, top: '59%', height: '11%' }},
+        {{ left: 60, right: 65, top: '72%', height: '11%' }},
+        {{ left: 60, right: 65, top: '85%', height: '11%' }}
+      ],
+      xAxis: [0, 1, 2, 3, 4].map(idx => ({{
+        type: 'category',
+        gridIndex: idx,
+        data: dates,
+        axisLabel: {{ show: idx === 4 }}
+      }})),
+      yAxis: [
+        {{ scale: true, gridIndex: 0, position: 'right' }},
+        {{ scale: true, gridIndex: 1, position: 'right', name: 'MACD', nameLocation: 'middle', nameGap: 35 }},
+        {{ min: 0, max: 100, gridIndex: 2, position: 'right', name: 'Slow STC', nameLocation: 'middle', nameGap: 35 }},
+        {{ min: 0, max: 100, gridIndex: 3, position: 'right', name: '9 RSI', nameLocation: 'middle', nameGap: 35 }},
+        {{ scale: true, gridIndex: 4, position: 'right', name: 'VOL', nameLocation: 'middle', nameGap: 35 }}
+      ],
+      dataZoom: [
+        {{ type: 'inside', xAxisIndex: [0, 1, 2, 3, 4], start: 0, end: 100 }},
+        {{ type: 'slider', xAxisIndex: [0, 1, 2, 3, 4], bottom: 4, height: 18, start: 0, end: 100 }}
+      ],
+      series: [
+        {{
+          name: '陰陽燭', type: 'candlestick', data: ohlc,
+          itemStyle: {{ color: '#ffffff', color0: '#0055aa', borderColor: '#cc0000', borderColor0: '#0055aa' }},
+          markLine: {{ symbol: ['none', 'none'], data: dailyMarkLines }}
+        }},
+        {{ name: '50-SMA', type: 'line', data: sma50, smooth: true, showSymbol: false, lineStyle: {{ width: 2, color: '#ff8c00' }} }},
+        {{ name: 'BB 中軸(20)', type: 'line', data: bbM, smooth: true, showSymbol: false, lineStyle: {{ width: 1.5, color: '#7b68ee' }} }},
+        {{ name: 'BB Upper(20,2)', type: 'line', data: bbU, smooth: true, showSymbol: false, lineStyle: {{ width: 1.1, type: 'dashed', color: '#7b68ee' }} }},
+        {{ name: 'BB Lower(20,2)', type: 'line', data: bbL, smooth: true, showSymbol: false, lineStyle: {{ width: 1.1, type: 'dashed', color: '#7b68ee' }} }},
+        {{ name: 'SAR(0.02,0.20)', type: 'scatter', data: sar, symbolSize: 5, itemStyle: {{ color: '#cc0000' }} }},
+        {{
+          name: 'MACD Difference', type: 'bar', xAxisIndex: 1, yAxisIndex: 1,
+          data: macdDiff.map(v => ({{ value: v, itemStyle: {{ color: v >= 0 ? '#cc0000' : '#0055aa' }} }}))
+        }},
+        {{ name: 'MACD(12,26)', type: 'line', xAxisIndex: 1, yAxisIndex: 1, data: macd, showSymbol: false, lineStyle: {{ width: 1.3, color: '#0055aa' }} }},
+        {{ name: '9-EMA', type: 'line', xAxisIndex: 1, yAxisIndex: 1, data: macdSig, showSymbol: false, lineStyle: {{ width: 1.3, color: '#cc0000' }} }},
+        {{ name: '藍線 %K (18)', type: 'line', xAxisIndex: 2, yAxisIndex: 2, data: stcSk, showSymbol: false, lineStyle: {{ width: 1.3, color: '#0055aa' }} }},
+        {{ name: '紅線 %D (5)', type: 'line', xAxisIndex: 2, yAxisIndex: 2, data: stcSd, showSymbol: false, lineStyle: {{ width: 1.3, color: '#cc0000' }} }},
+        {{ name: '9 RSI', type: 'line', xAxisIndex: 3, yAxisIndex: 3, data: rsi9, showSymbol: false, lineStyle: {{ width: 1.3, color: '#0055aa' }} }},
+        {{ name: 'RSI 5-SMA', type: 'line', xAxisIndex: 3, yAxisIndex: 3, data: rsiSma5, showSymbol: false, lineStyle: {{ width: 1.3, color: '#cc0000' }} }},
+        {{ name: '14 RSI (參考)', type: 'line', xAxisIndex: 3, yAxisIndex: 3, data: rsi14, showSymbol: false, lineStyle: {{ width: 1.0, type: 'dotted', color: '#888888' }} }},
+        {{ name: 'VOL', type: 'bar', xAxisIndex: 4, yAxisIndex: 4, data: vols }},
+        {{ name: 'VOL 5-SMA', type: 'line', xAxisIndex: 4, yAxisIndex: 4, data: volSma5, showSymbol: false, lineStyle: {{ width: 1.3, color: '#669900' }} }}
+      ]
+    }};
+    chart.setOption(option);
+    window.addEventListener('resize', () => chart.resize());
+  </script>
+</body>
+</html>"""
+
+    out_dir = os.path.dirname(os.path.abspath(output_html))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(output_html, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"[圖表] 已輸出互動式 HTML 圖表 ({title_prefix}): {output_html}")
+    return output_html
+
+
+def export_15m_sql_and_db(
+    df_15m_ind: pd.DataFrame, output_dir: str = ".", prefix: str = "hsi_futures"
+) -> Tuple[str, str]:
+    """
+    另行生成每 15 分鐘數據與技術指標檢查檔:
+    1. 獨立 SQLite 資料庫檔: hsi_futures_15m.db (內含 intervals_15m_indicators 表)
+    2. 標準 SQL 語句檢查檔: hsi_futures_15m.sql
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    db_15m_path = os.path.join(output_dir, f"{prefix}_15m.db")
+    sql_15m_path = os.path.join(output_dir, f"{prefix}_15m.sql")
+
+    df_save = df_15m_ind.copy()
+    df_save["timestamp"] = pd.to_datetime(df_save["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+    for col in [
+        "sma_50", "bb_mid", "bb_upper", "bb_lower", "sar",
+        "macd", "macd_signal", "macd_diff", "vol_sma_5",
+        "stc_sk", "stc_sd", "rsi_9", "rsi_sma_5", "rsi_14",
+    ]:
+        if col in df_save.columns:
+            df_save[col] = df_save[col].round(2)
+
+    avail_cols = [c for c in COLS_15M_DETAIL if c in df_save.columns]
+    df_save = df_save[avail_cols]
+
+    if os.path.exists(db_15m_path):
+        os.remove(db_15m_path)
+
+    with sqlite3.connect(db_15m_path) as conn:
+        df_save.to_sql("intervals_15m_indicators", conn, index=False)
+        conn.commit()
+        with open(sql_15m_path, "w", encoding="utf-8") as f:
+            f.write("-- 恒生指數期貨 (HSI Futures) 每 15 分鐘 K 線與技術指標檢查 SQL 檔\n")
+            f.write(f"-- 生成時間 (HKT): {now_hkt().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            for line in conn.iterdump():
+                f.write(f"{line}\n")
+
+    return db_15m_path, sql_15m_path
+
+
+# =====================================================================
+# 7. 模擬測試數據生成器 (驗證香港公眾假期、etnet 6時段切分及 250 日均線橫線)
+# =====================================================================
+
+def generate_demo_datasets(
+    intraday_start_date: dt.date = dt.date(2026, 10, 6),
+    intraday_end_date: dt.date = dt.date(2026, 10, 29),
+    total_daily_history_days: int = 260,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    產生:
+    1. 過去 260 個香港交易日的按日統計數據 (排除週末與香港公眾假期)，以供計算 20 / 50 / 250 日均線橫線。
+    2. 近期 (2026-10-06 至 2026-10-29，當中自動跳過 10月19日重陽節翌日香港公眾假期，
+       並在 10月29日最後交易日自動轉倉至 202611 合約) 的 15 分鐘時段記錄。
+    """
+    rng = np.random.default_rng(seed)
+    holidays = get_hk_holidays_set()
+
+    trading_days = []
+    cur = intraday_end_date
+    while len(trading_days) < total_daily_history_days:
+        if is_hk_trading_day(cur, holidays):
+            trading_days.append(cur)
+        cur -= dt.timedelta(days=1)
+    trading_days.reverse()
+
+    intraday_slots = [
+        "09:30", "09:45", "10:00",
+        "10:15", "10:30", "10:45", "11:00",
+        "11:15", "11:30", "11:45", "12:00",
+        "13:15", "13:30", "13:45", "14:00",
+        "14:15", "14:30", "14:45", "15:00",
+        "15:15", "15:30", "15:45", "16:00", "16:15", "16:30",
+    ]
+
+    daily_rows = []
+    intraday_rows = []
+    price = 23150.0
+
+    for d in trading_days:
+        contract_month, is_rolled, _ = resolve_target_contract_month(
+            d, rollover_rule="hkex", holidays=holidays
+        )
+        if d < intraday_start_date:
+            mean_revert = (23750.0 - price) * 0.06
+            d_open = round(price)
+            d_close = round(max(19500.0, d_open + mean_revert + rng.normal(0.0, 110.0)))
+            d_high = round(max(d_open, d_close) + abs(rng.normal(0, 75.0)))
+            d_low = round(min(d_open, d_close) - abs(rng.normal(0, 75.0)))
+            d_vol = float(int(rng.integers(65000, 145000)))
+            price = d_close
+            daily_rows.append(
+                {
+                    "trade_date": d.strftime("%Y-%m-%d"),
+                    "contract_month": contract_month,
+                    "open": float(d_open),
+                    "high": float(d_high),
+                    "low": float(d_low),
+                    "close": float(d_close),
+                    "volume": d_vol,
+                }
+            )
+        else:
+            if d == intraday_start_date:
+                price = 24202.0
+            elif is_rolled and intraday_rows and intraday_rows[-1]["contract_month"] != contract_month:
+                price += 28.0
+
+            for t_str in intraday_slots:
+                hh, mm = map(int, t_str.split(":"))
+                ts = dt.datetime.combine(d, dt.time(hh, mm))
+                change = rng.normal(-3.2, 34.0)
+                o = round(price)
+                c = round(max(18000.0, o + change))
+                h = round(max(o, c) + abs(rng.normal(0, 22.0)))
+                l = round(min(o, c) - abs(rng.normal(0, 22.0)))
+                vol = int(rng.integers(1200, 8800))
+                trades = int(vol * rng.uniform(0.45, 0.65))
+                price = c
+
+                intraday_rows.append(
+                    {
+                        "timestamp": ts,
+                        "trade_date": d.strftime("%Y-%m-%d"),
+                        "time_str": t_str,
+                        "contract_month": contract_month,
+                        "open": float(o),
+                        "high": float(h),
+                        "low": float(l),
+                        "close": float(c),
+                        "volume": float(vol),
+                        "trades": float(trades),
+                    }
+                )
+
+    return pd.DataFrame(daily_rows), pd.DataFrame(intraday_rows)
+
+
+# =====================================================================
+# 8. 主程式入口 (同時輸出 1 小時圖與 15 分鐘圖，成交量置於技術指標最底層)
+# =====================================================================
+
+def run_once(args: argparse.Namespace, store: FuturesDataStore) -> int:
+    holidays = get_hk_holidays_set(args.holidays_file)
+    today = today_hkt()
+    target_month, is_rolled, last_td = resolve_target_contract_month(
+        target_date=today,
+        forced_month=args.month,
+        rollover_rule=args.rollover_rule,
+        holidays=holidays,
+    )
+
+    holiday_note = (
+        f" (當日為香港公眾假期: {HK_PUBLIC_HOLIDAYS[today]})"
+        if today in HK_PUBLIC_HOLIDAYS
+        else ""
+    )
+    print(f"[設定] 香港日期: {today}{holiday_note} | 本月最後交易日 (已扣香港公眾假期): {last_td}")
+    if is_rolled:
+        print(f"[轉倉] 今日已達或超過本月最後交易日 ({last_td})，今日新數據自動以下一個月合約 ({target_month}) 代替（過往日期數據完整保留）！")
+    else:
+        print(f"[合約] 目標期貨合約月份: {target_month}")
+
+    if args.demo:
+        print("[模式] 啟動模擬數據模式 (--demo)，載入 260 日歷史日線及 15 分鐘時段記錄...")
+        df_hist_1d, df_15m = generate_demo_datasets()
+        store.save_historical_daily_bars(df_hist_1d)
+        store.save_interval_data(df_15m, is_last_trading_day_rollover=True, rollover_rule=args.rollover_rule)
+    else:
+        if getattr(args, "github_db_url", None) or DEFAULT_GITHUB_RAW_DB_URL:
+            store.sync_from_github_db(
+                github_db_url=getattr(args, "github_db_url", None),
+                github_token=getattr(args, "github_token", None),
+            )
+
+        df_fetched = None
+        try:
+            df_fetched = fetch_etnet_interval_data(
+                contract_month=target_month,
+                subtype=args.subtype,
+                trade_date=today,
+            )
+        except Exception as exc:
+            print(f"[警告] 即時擷取 etnet 失敗或尚未開市 ({exc})。")
+
+        if getattr(args, "import_csv", None) and os.path.exists(args.import_csv):
+            try:
+                df_imp = pd.read_csv(args.import_csv)
+                if set(COLS_15M).issubset(df_imp.columns):
+                    store.save_interval_data(
+                        df_imp[COLS_15M],
+                        is_last_trading_day_rollover=False,
+                        rollover_rule=args.rollover_rule,
+                    )
+                    print(f"[匯入] 已從外部 CSV ({args.import_csv}) 匯入 {len(df_imp)} 筆 15 分鐘數據。")
+            except Exception as exc:
+                print(f"[警告] 匯入外部 CSV 失敗 ({exc})。")
+
+        if df_fetched is not None and not df_fetched.empty:
+            store.save_interval_data(
+                df_fetched,
+                is_last_trading_day_rollover=is_rolled,
+                rollover_rule=args.rollover_rule,
+            )
+            print(f"[儲存] 成功擷取並按時間順序儲存 {len(df_fetched)} 筆 15 分鐘時段數據。")
+        else:
+            existing_15m = store.load_intervals_15m()
+            if not existing_15m.empty:
+                print(f"[資料庫] 使用本地資料庫現有的 {len(existing_15m)} 筆 15 分鐘記錄重新整理並繪製圖表...")
+                store.sanitize_and_sort_db()
+
+        # 自動檢查是否有遺漏的過往交易日，若有則嘗試從 etnet 互動圖表或上日匯總自動補回
+        existing_15m_after = store.load_intervals_15m()
+        if not existing_15m_after.empty:
+            recorded_dates = set(existing_15m_after["trade_date"].unique())
+            min_d = dt.date.fromisoformat(min(recorded_dates))
+            prev_td = get_previous_trading_day(today, holidays)
+            missing_dates = []
+            cur_d = min_d
+            while cur_d <= prev_td:
+                if is_hk_trading_day(cur_d, holidays) and cur_d.strftime("%Y-%m-%d") not in recorded_dates:
+                    missing_dates.append(cur_d.strftime("%Y-%m-%d"))
+                cur_d += dt.timedelta(days=1)
+            if missing_dates:
+                print(f"[缺漏偵測] 發現遺漏交易日: {', '.join(missing_dates)}，正在嘗試從 etnet 補回...")
+                df_backfill = fetch_etnet_interactive_chart_backfill(
+                    contract_month=target_month,
+                    target_dates=missing_dates,
+                    subtype=args.subtype,
+                )
+                if not df_backfill.empty:
+                    store.save_interval_data(df_backfill, is_last_trading_day_rollover=False, rollover_rule=args.rollover_rule)
+                    print(f"[自動補回] 成功從 etnet 互動圖表補回 {len(df_backfill)} 筆 15 分鐘數據！")
+                elif prev_td.strftime("%Y-%m-%d") in missing_dates:
+                    prev_summary = fetch_etnet_prev_day_summary(
+                        contract_month=target_month, subtype=args.subtype, trade_date=today
+                    )
+                    if prev_summary is not None:
+                        store.save_historical_daily_bars(pd.DataFrame([prev_summary])[COLS_1D])
+                        print(f"[上日匯總補回] 已從 etnet 時段表『上日』列補回 {prev_td} 日線 OHLCV 數據。")
+
+    # 另行生成每小時數據專用的 SQLite 資料庫檔 (hsi_futures_1h.db) 及標準 SQL 語句檔 (hsi_futures_1h.sql)
+    hourly_db_path, hourly_sql_path = store.export_hourly_sql_and_db(output_dir=args.csv_dir)
+    print(f"[每小時SQL檔] 已另行生成每小時檢查資料庫與SQL檔: {hourly_db_path} 及 {hourly_sql_path}")
+
+    csv_15m, csv_1h, csv_1d = store.export_csv(output_dir=args.csv_dir)
+    print(f"[匯出] 已儲存 CSV 檔案: {csv_15m} (15分鐘)、{csv_1h} (1小時含指標評分) 及 {csv_1d} (日線)")
+
+    df_1h = store.load_hourly_bars()
+    df_15m_raw = store.load_intervals_15m()
+    df_1d = store.load_daily_bars()
+    if df_1h.empty or df_15m_raw.empty:
+        print("[錯誤] 無可用的數據可供繪圖。")
+        return 1
+
+    trading_dates_list = sorted(df_1h["trade_date"].unique().tolist())
+    print(
+        f"[跨日連接] 圖表已連接 {len(trading_dates_list)} 個交易日 ({' -> '.join(trading_dates_list)})，"
+        f"共 {len(df_1h)} 根小時燭、{len(df_15m_raw)} 根 15 分鐘燭。"
+    )
+
+    daily_sma_levels = compute_daily_sma_levels(df_1d)
+    lvl_summary = " | ".join(
+        f"按日{p}MA: {v:,.1f}" if v is not None else f"按日{p}MA: 數據未足({len(df_1d)}/{p}日)"
+        for p, v in daily_sma_levels.items()
+    )
+    print(f"[日線均線橫線] 已累積 {len(df_1d)} 個交易日 -> {lvl_summary}")
+
+    # ==================== 1. 繪製 1 小時圖 (1H) ====================
+    df_1h_ind = compute_all_indicators(df_1h)
+    plot_static_chart(
+        df_1h_ind,
+        daily_sma_levels=daily_sma_levels,
+        output_png=args.output_png,
+        title_prefix="HSI 恒生指數期貨 (小時圖)",
+        timeframe="1h",
+    )
+    if args.output_html:
+        export_interactive_html_chart(
+            df_1h_ind,
+            daily_sma_levels=daily_sma_levels,
+            output_html=args.output_html,
+            title_prefix="HSI 恒生指數期貨 (小時圖)",
+        )
+
+    # ==================== 2. 繪製 15 分鐘圖 (15M) 及輸出 15M 指標 SQL ====================
+    df_15m_for_ind = df_15m_raw.copy()
+    df_15m_for_ind["timestamp"] = pd.to_datetime(df_15m_for_ind["timestamp"])
+    df_15m_ind = compute_all_indicators(df_15m_for_ind)
+
+    db_15m_path, sql_15m_path = export_15m_sql_and_db(df_15m_ind, output_dir=args.csv_dir)
+    print(f"[15分鐘SQL檔] 已另行生成 15 分鐘檢查資料庫與SQL檔: {db_15m_path} 及 {sql_15m_path}")
+
+    # 同步把含指標與評分的 15 分鐘數據覆寫至 hsi_futures_15m.csv
+    df_15m_csv = df_15m_ind.copy()
+    df_15m_csv["timestamp"] = df_15m_csv["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    df_15m_csv.to_csv(csv_15m, index=False, encoding="utf-8-sig")
+
+    plot_static_chart(
+        df_15m_ind,
+        daily_sma_levels=daily_sma_levels,
+        output_png=args.output_png_15m,
+        title_prefix="HSI 恒生指數期貨 (15分鐘圖)",
+        timeframe="15m",
+        max_bars=args.max_bars_15m,
+    )
+    if args.output_html_15m:
+        export_interactive_html_chart(
+            df_15m_ind,
+            daily_sma_levels=daily_sma_levels,
+            output_html=args.output_html_15m,
+            title_prefix="HSI 恒生指數期貨 (15分鐘圖)",
+        )
+
+    return 0
+
+
+def main(cli_args: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="恒生指數期貨 (etnet) 自動下載、最後交易日轉倉儲存及小時圖 + 15分鐘圖技術分析工具"
+    )
+    parser.add_argument("--subtype", default="HSI", help="期貨品種代碼 (預設: HSI)")
+    parser.add_argument(
+        "--month",
+        default=None,
+        help="指定合約月份 YYYYMM (如 202610)；若當日為該月最後交易日，程式會自動改用下月合約代替",
+    )
+    parser.add_argument(
+        "--rollover-rule",
+        choices=["hkex", "last_bd"],
+        default="hkex",
+        help="最後交易日規則: hkex=每月倒數第二個營業日 (期指結算日), last_bd=每月最後一個營業日",
+    )
+    parser.add_argument(
+        "--holidays-file",
+        default=None,
+        help="選用的額外公眾假期 CSV/TXT 檔案路徑 (每行一個 YYYY-MM-DD 日期)",
+    )
+    parser.add_argument("--db", default="hsi_futures.db", help="SQLite 資料庫路徑 (預設: hsi_futures.db)")
+    parser.add_argument(
+        "--import-csv",
+        default=None,
+        help="選用的外部 15 分鐘 CSV 檔案路徑，用於手動補回過往缺漏交易日數據",
+    )
+    parser.add_argument(
+        "--github-db-url",
+        default=None,
+        help="選用的 GitHub Raw hsi_futures.db 網址，執行時先自動拉取 GitHub Actions 累積的數據並合併",
+    )
+    parser.add_argument(
+        "--github-token",
+        default=None,
+        help="若 GitHub 儲存庫為 Private (私人)，可傳入 GitHub Personal Access Token 以拉取資料庫",
+    )
+    parser.add_argument("--csv-dir", default=".", help="CSV 與 SQL 檔匯出資料夾路徑 (預設: 當前目錄)")
+    parser.add_argument("--output-png", default="hsi_futures_chart.png", help="輸出小時圖靜態 PNG 路徑")
+    parser.add_argument("--output-html", default="hsi_futures_chart.html", help="輸出小時圖互動式 HTML 路徑")
+    parser.add_argument("--output-png-15m", default="hsi_futures_15m_chart.png", help="輸出 15 分鐘圖靜態 PNG 路徑")
+    parser.add_argument("--output-html-15m", default="hsi_futures_15m_chart.html", help="輸出 15 分鐘圖互動式 HTML 路徑")
+    parser.add_argument(
+        "--max-bars-15m",
+        type=int,
+        default=100,
+        help="15分鐘靜態圖表最多顯示最近幾根K線 (預設: 100 根，約 4 個交易日；技術指標仍以全歷史計算)",
+    )
+    parser.add_argument(
+        "--mount-drive",
+        action="store_true",
+        help="在 Google Colab 中自動掛載 Google Drive 並將資料庫與圖表存於 /content/drive/MyDrive/HSI_Futures/",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="持續定時監測並下載更新數據 (適合日市交易時段掛機累積數據)",
+    )
+    parser.add_argument("--interval", type=int, default=300, help="定時更新間隔秒數 (預設: 300 秒)")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="使用模擬跨日數據測試完整資料庫儲存、最後交易日轉倉、etnet 6時段切分及日線均線橫線",
+    )
+
+    args, _ = parser.parse_known_args(cli_args)
+
+    if is_running_in_colab():
+        if not os.path.exists("/content/drive/MyDrive"):
+            try:
+                from google.colab import drive  # type: ignore
+                drive.mount("/content/drive", force_remount=False)
+            except Exception as exc:
+                print(f"[警告] 掛載 Google Drive 失敗 ({exc})，改用 Colab 本地目錄。")
+
+        if os.path.exists("/content/drive/MyDrive"):
+            drive_dir = "/content/drive/MyDrive/HSI_Futures"
+            os.makedirs(drive_dir, exist_ok=True)
+            if args.db == "hsi_futures.db":
+                args.db = os.path.join(drive_dir, "hsi_futures.db")
+            if args.csv_dir == ".":
+                args.csv_dir = drive_dir
+            if args.output_png == "hsi_futures_chart.png":
+                args.output_png = os.path.join(drive_dir, "hsi_futures_chart.png")
+            if args.output_html == "hsi_futures_chart.html":
+                args.output_html = os.path.join(drive_dir, "hsi_futures_chart.html")
+            if args.output_png_15m == "hsi_futures_15m_chart.png":
+                args.output_png_15m = os.path.join(drive_dir, "hsi_futures_15m_chart.png")
+            if args.output_html_15m == "hsi_futures_15m_chart.html":
+                args.output_html_15m = os.path.join(drive_dir, "hsi_futures_15m_chart.html")
+            print(f"[Colab Drive] 已自動連結 Google Drive 儲存目錄: {drive_dir}")
+
+    store = FuturesDataStore(db_path=args.db, restore_oct28=(not args.demo))
+
+    if not args.watch:
+        return run_once(args, store)
+
+    print(f"[監測模式] 每 {args.interval} 秒自動從 etnet 更新數據 (按 Ctrl+C 停止)...")
+    try:
+        while True:
+            run_once(args, store)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\n[停止] 已結束定時監測。")
+        return 0
+
+
+if __name__ == "__main__":
+    main()
