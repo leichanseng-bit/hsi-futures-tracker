@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HSI 恒生指數期貨 (小時圖) 技術分析工具</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+  <style>
+    body { margin: 0; padding: 12px; font-family: "Microsoft JhengHei", "PingFang HK", sans-serif; background: #f5f7fa; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 14px; }
+    #chart { width: 100%; height: 900px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="chart"></div>
+  </div>
+  <script>
+    const rawData = [{"ts": "2026-10-28 10:00", "month": "202610", "open": 23105.0, "high": 23167.0, "low": 23041.0, "close": 23065.0, "vol": 24736, "sma50": 23065.0, "bb_u": 23065.0, "bb_m": 23065.0, "bb_l": 23065.0, "sar": 23167.0, "macd": 0.0, "macd_sig": 0.0, "macd_diff": 0.0, "vol_sma5": 24736.0, "stc_sk": 19.05, "stc_sd": 19.05, "rsi9": 50.0, "rsi_sma5": 50.0, "rsi14": 50.0, "total_score": -1}, {"ts": "2026-10-28 11:00", "month": "202610", "open": 23065.0, "high": 23142.0, "low": 23054.0, "close": 23109.0, "vol": 16581, "sma50": 23087.0, "bb_u": 23131.0, "bb_m": 23087.0, "bb_l": 23043.0, "sar": 23167.0, "macd": 3.51, "macd_sig": 0.7, "macd_diff": 2.81, "vol_sma5": 20658.0, "stc_sk": 36.51, "stc_sd": 27.78, "rsi9": 100.0, "rsi_sma5": 75.0, "rsi14": 100.0, "total_score": 3}, {"ts": "2026-10-28 12:00", "month": "202610", "open": 23109.0, "high": 23189.0, "low": 23096.0, "close": 23170.0, "vol": 8730, "sma50": 23114.7, "bb_u": 23200.8, "bb_m": 23114.7, "bb_l": 23028.6, "sar": 23041.0, "macd": 11.09, "macd_sig": 2.78, "macd_diff": 8.31, "vol_sma5": 16682.0, "stc_sk": 53.39, "stc_sd": 36.32, "rsi9": 100.0, "rsi_sma5": 83.33, "rsi14": 100.0, "total_score": 5}, {"ts": "2026-10-28 14:00", "month": "202610", "open": 23167.0, "high": 23168.0, "low": 23068.0, "close": 23084.0, "vol": 10281, "sma50": 23107.0, "bb_u": 23186.2, "bb_m": 23107.0, "bb_l": 23027.8, "sar": 23044.0, "macd": 10.03, "macd_sig": 4.23, "macd_diff": 5.8, "vol_sma5": 15082.0, "stc_sk": 47.31, "stc_sd": 39.06, "rsi9": 50.85, "rsi_sma5": 75.21, "rsi14": 52.38, "total_score": 1}, {"ts": "2026-10-28 15:00", "month": "202610", "open": 23083.0, "high": 23127.0, "low": 23082.0, "close": 23092.0, "vol": 9026, "sma50": 23104.0, "bb_u": 23175.8, "bb_m": 23104.0, "bb_l": 23032.2, "sar": 23046.9, "macd": 9.74, "macd_sig": 5.33, "macd_diff": 4.4, "vol_sma5": 13871.0, "stc_sk": 44.74, "stc_sd": 40.2, "rsi9": 53.26, "rsi_sma5": 70.82, "rsi14": 54.54, "total_score": 1}, {"ts": "2026-10-28 16:00", "month": "202610", "open": 23091.0, "high": 23143.0, "low": 23068.0, "close": 23068.0, "vol": 11625, "sma50": 23098.0, "bb_u": 23168.8, "bb_m": 23098.0, "bb_l": 23027.2, "sar": 23049.7, "macd": 7.48, "macd_sig": 5.76, "macd_diff": 1.72, "vol_sma5": 11249.0, "stc_sk": 44.58, "stc_sd": 45.3, "rsi9": 45.71, "rsi_sma5": 69.96, "rsi14": 47.55, "total_score": -1}, {"ts": "2026-11-05 10:00", "month": "202611", "open": 24380.0, "high": 24632.0, "low": 24273.0, "close": 24588.0, "vol": 31656, "sma50": 23310.9, "bb_u": 24355.7, "bb_m": 23310.9, "bb_l": 22266.0, "sar": 23052.5, "macd": 126.87, "macd_sig": 29.98, "macd_diff": 96.89, "vol_sma5": 14264.0, "stc_sk": 53.23, "stc_sd": 48.65, "rsi9": 95.11, "rsi_sma5": 68.99, "rsi14": 94.62, "total_score": 5}, {"ts": "2026-11-05 11:00", "month": "202611", "open": 24589.0, "high": 24727.0, "low": 24575.0, "close": 24682.0, "vol": 24150, "sma50": 23482.2, "bb_u": 24815.6, "bb_m": 23482.2, "bb_l": 22148.9, "sar": 23068.0, "macd": 226.47, "macd_sig": 69.28, "macd_diff": 157.19, "vol_sma5": 17348.0, "stc_sk": 55.26, "stc_sd": 49.02, "rsi9": 95.4, "rsi_sma5": 68.07, "rsi14": 94.92, "total_score": 5}, {"ts": "2026-11-05 12:00", "month": "202611", "open": 24684.0, "high": 24771.0, "low": 24667.0, "close": 24680.0, "vol": 14646, "sma50": 23615.3, "bb_u": 25080.6, "bb_m": 23615.3, "bb_l": 22150.1, "sar": 23167.5, "macd": 301.76, "macd_sig": 115.78, "macd_diff": 185.99, "vol_sma5": 18221.0, "stc_sk": 68.4, "stc_sd": 53.24, "rsi9": 95.26, "rsi_sma5": 76.95, "rsi14": 94.8, "total_score": 5}, {"ts": "2026-11-05 14:00", "month": "202611", "open": 24688.0, "high": 24747.0, "low": 24609.0, "close": 24649.0, "vol": 15205, "sma50": 23718.7, "bb_u": 25240.8, "bb_m": 23718.7, "bb_l": 22196.6, "sar": 23295.8, "macd": 354.84, "macd_sig": 163.59, "macd_diff": 191.25, "vol_sma5": 19456.0, "stc_sk": 80.1, "stc_sd": 60.31, "rsi9": 92.96, "rsi_sma5": 84.89, "rsi14": 92.8, "total_score": 5}, {"ts": "2026-11-05 15:00", "month": "202611", "open": 24649.0, "high": 24812.0, "low": 24648.0, "close": 24803.0, "vol": 13486, "sma50": 23817.3, "bb_u": 25396.8, "bb_m": 23817.3, "bb_l": 22237.7, "sar": 23413.8, "macd": 404.67, "macd_sig": 211.8, "macd_diff": 192.86, "vol_sma5": 19829.0, "stc_sk": 96.35, "stc_sd": 70.67, "rsi9": 93.8, "rsi_sma5": 94.5, "rsi14": 93.53, "total_score": 3}, {"ts": "2026-11-05 16:00", "month": "202611", "open": 24803.0, "high": 24896.0, "low": 24741.0, "close": 24886.0, "vol": 26407, "sma50": 23906.3, "bb_u": 25529.9, "bb_m": 23906.3, "bb_l": 22282.7, "sar": 23553.6, "macd": 445.71, "macd_sig": 258.59, "macd_diff": 187.13, "vol_sma5": 18779.0, "stc_sk": 96.79, "stc_sd": 79.38, "rsi9": 94.21, "rsi_sma5": 94.33, "rsi14": 93.89, "total_score": 3}, {"ts": "2026-11-06 10:00", "month": "202611", "open": 24411.0, "high": 24711.0, "low": 24354.0, "close": 24661.0, "vol": 28633, "sma50": 23964.4, "bb_u": 25575.3, "bb_m": 23964.4, "bb_l": 22353.5, "sar": 23714.7, "macd": 454.84, "macd_sig": 297.84, "macd_diff": 157.01, "vol_sma5": 19675.0, "stc_sk": 94.79, "stc_sd": 87.29, "rsi9": 78.15, "rsi_sma5": 90.88, "rsi14": 80.78, "total_score": 3}, {"ts": "2026-11-06 11:00", "month": "202611", "open": 24663.0, "high": 24749.0, "low": 24565.0, "close": 24709.0, "vol": 15665, "sma50": 24017.6, "bb_u": 25616.6, "bb_m": 24017.6, "bb_l": 22418.6, "sar": 23856.5, "macd": 460.64, "macd_sig": 330.4, "macd_diff": 130.25, "vol_sma5": 19879.0, "stc_sk": 93.83, "stc_sd": 92.37, "rsi9": 79.01, "rsi_sma5": 87.63, "rsi14": 81.38, "total_score": 3}, {"ts": "2026-11-06 12:00", "month": "202611", "open": 24709.0, "high": 24726.0, "low": 24479.0, "close": 24530.0, "vol": 10168, "sma50": 24051.7, "bb_u": 25617.5, "bb_m": 24051.7, "bb_l": 22486.0, "sar": 23981.2, "macd": 445.66, "macd_sig": 353.45, "macd_diff": 92.21, "vol_sma5": 18872.0, "stc_sk": 91.29, "stc_sd": 94.61, "rsi9": 67.82, "rsi_sma5": 82.6, "rsi14": 72.35, "total_score": 1}];
+    const dailyMarkLines = [];
+    const dates = rawData.map(d => d.ts);
+    const ohlc = rawData.map(d => [d.open, d.close, d.low, d.high]);
+    const sma50 = rawData.map(d => d.sma50);
+    const bbU = rawData.map(d => d.bb_u);
+    const bbM = rawData.map(d => d.bb_m);
+    const bbL = rawData.map(d => d.bb_l);
+    const sar = rawData.map(d => d.sar);
+    const macd = rawData.map(d => d.macd);
+    const macdSig = rawData.map(d => d.macd_sig);
+    const macdDiff = rawData.map(d => d.macd_diff);
+    const vols = rawData.map(d => ({
+      value: d.vol,
+      itemStyle: { color: d.close >= d.open ? '#cc0000' : '#0055aa' }
+    }));
+    const volSma5 = rawData.map(d => d.vol_sma5);
+    const stcSk = rawData.map(d => d.stc_sk);
+    const stcSd = rawData.map(d => d.stc_sd);
+    const rsi9 = rawData.map(d => d.rsi9);
+    const rsiSma5 = rawData.map(d => d.rsi_sma5);
+    const rsi14 = rawData.map(d => d.rsi14);
+
+    const chart = echarts.init(document.getElementById('chart'));
+    const option = {
+      title: { text: 'HSI 恒生指數期貨 (小時圖) — SAR + BB(20,2)中軸 + MACD Diff + Slow STC(18,5) + 9 RSI + VOL(最底層)', left: 10, textStyle: { fontSize: 14, color: '#003366' } },
+      tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+      axisPointer: { link: [{ xAxisIndex: 'all' }] },
+      legend: { top: 28, data: ['陰陽燭', '50-SMA', 'BB 中軸(20)', 'BB Upper(20,2)', 'BB Lower(20,2)', 'SAR(0.02,0.20)'] },
+      grid: [
+        { left: 60, right: 65, top: 65, height: '36%' },
+        { left: 60, right: 65, top: '46%', height: '11%' },
+        { left: 60, right: 65, top: '59%', height: '11%' },
+        { left: 60, right: 65, top: '72%', height: '11%' },
+        { left: 60, right: 65, top: '85%', height: '11%' }
+      ],
+      xAxis: [0, 1, 2, 3, 4].map(idx => ({
+        type: 'category',
+        gridIndex: idx,
+        data: dates,
+        axisLabel: { show: idx === 4 }
+      })),
+      yAxis: [
+        { scale: true, gridIndex: 0, position: 'right' },
+        { scale: true, gridIndex: 1, position: 'right', name: 'MACD', nameLocation: 'middle', nameGap: 35 },
+        { min: 0, max: 100, gridIndex: 2, position: 'right', name: 'Slow STC', nameLocation: 'middle', nameGap: 35 },
+        { min: 0, max: 100, gridIndex: 3, position: 'right', name: '9 RSI', nameLocation: 'middle', nameGap: 35 },
+        { scale: true, gridIndex: 4, position: 'right', name: 'VOL', nameLocation: 'middle', nameGap: 35 }
+      ],
+      dataZoom: [
+        { type: 'inside', xAxisIndex: [0, 1, 2, 3, 4], start: 0, end: 100 },
+        { type: 'slider', xAxisIndex: [0, 1, 2, 3, 4], bottom: 4, height: 18, start: 0, end: 100 }
+      ],
+      series: [
+        {
+          name: '陰陽燭', type: 'candlestick', data: ohlc,
+          itemStyle: { color: '#ffffff', color0: '#0055aa', borderColor: '#cc0000', borderColor0: '#0055aa' },
+          markLine: { symbol: ['none', 'none'], data: dailyMarkLines }
+        },
+        { name: '50-SMA', type: 'line', data: sma50, smooth: true, showSymbol: false, lineStyle: { width: 2, color: '#ff8c00' } },
+        { name: 'BB 中軸(20)', type: 'line', data: bbM, smooth: true, showSymbol: false, lineStyle: { width: 1.5, color: '#7b68ee' } },
+        { name: 'BB Upper(20,2)', type: 'line', data: bbU, smooth: true, showSymbol: false, lineStyle: { width: 1.1, type: 'dashed', color: '#7b68ee' } },
+        { name: 'BB Lower(20,2)', type: 'line', data: bbL, smooth: true, showSymbol: false, lineStyle: { width: 1.1, type: 'dashed', color: '#7b68ee' } },
+        { name: 'SAR(0.02,0.20)', type: 'scatter', data: sar, symbolSize: 5, itemStyle: { color: '#cc0000' } },
+        {
+          name: 'MACD Difference', type: 'bar', xAxisIndex: 1, yAxisIndex: 1,
+          data: macdDiff.map(v => ({ value: v, itemStyle: { color: v >= 0 ? '#cc0000' : '#0055aa' } }))
+        },
+        { name: 'MACD(12,26)', type: 'line', xAxisIndex: 1, yAxisIndex: 1, data: macd, showSymbol: false, lineStyle: { width: 1.3, color: '#0055aa' } },
+        { name: '9-EMA', type: 'line', xAxisIndex: 1, yAxisIndex: 1, data: macdSig, showSymbol: false, lineStyle: { width: 1.3, color: '#cc0000' } },
+        { name: '藍線 %K (18)', type: 'line', xAxisIndex: 2, yAxisIndex: 2, data: stcSk, showSymbol: false, lineStyle: { width: 1.3, color: '#0055aa' } },
+        { name: '紅線 %D (5)', type: 'line', xAxisIndex: 2, yAxisIndex: 2, data: stcSd, showSymbol: false, lineStyle: { width: 1.3, color: '#cc0000' } },
+        { name: '9 RSI', type: 'line', xAxisIndex: 3, yAxisIndex: 3, data: rsi9, showSymbol: false, lineStyle: { width: 1.3, color: '#0055aa' } },
+        { name: 'RSI 5-SMA', type: 'line', xAxisIndex: 3, yAxisIndex: 3, data: rsiSma5, showSymbol: false, lineStyle: { width: 1.3, color: '#cc0000' } },
+        { name: '14 RSI (參考)', type: 'line', xAxisIndex: 3, yAxisIndex: 3, data: rsi14, showSymbol: false, lineStyle: { width: 1.0, type: 'dotted', color: '#888888' } },
+        { name: 'VOL', type: 'bar', xAxisIndex: 4, yAxisIndex: 4, data: vols },
+        { name: 'VOL 5-SMA', type: 'line', xAxisIndex: 4, yAxisIndex: 4, data: volSma5, showSymbol: false, lineStyle: { width: 1.3, color: '#669900' } }
+      ]
+    };
+    chart.setOption(option);
+    window.addEventListener('resize', () => chart.resize());
+  </script>
+</body>
+</html>
