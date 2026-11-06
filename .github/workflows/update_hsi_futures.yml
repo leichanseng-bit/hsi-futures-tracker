@@ -1,0 +1,113 @@
+name: HSI Futures Auto Data Collector (etnet)
+
+on:
+  # 支援在 GitHub Actions 頁面或手機 GitHub App 隨時手動一鍵觸發
+  workflow_dispatch:
+    inputs:
+      forced_month:
+        description: "選填：指定期貨合約月份 YYYYMM (留空則自動計算即月及最後交易日轉倉)"
+        required: false
+        default: ""
+
+  # 每個港股交易日 (週一至週五) 自動定時執行 (GitHub Actions 使用 UTC 時間，香港時間 HKT = UTC + 8)
+  # 對應香港時間 (HKT):
+  # - 早市: 10:03 (02:03 UTC)、11:03 (03:03 UTC)、12:05 (04:05 UTC 早市收市)
+  # - 午市: 14:03 (06:03 UTC)、15:03 (07:03 UTC)、16:03 (08:03 UTC)
+  # - 日市收市鎖定全日25筆數據: 16:35 (08:35 UTC) 及 17:15 (09:15 UTC 二次保險備份)
+  schedule:
+    - cron: "3 2,3,6,7,8 * * 1-5"
+    - cron: "5 4 * * 1-5"
+    - cron: "35 8 * * 1-5"
+    - cron: "15 9 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hsi-futures-etnet-updater
+  cancel-in-progress: false
+
+jobs:
+  collect-and-analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 1. 檢出儲存庫 (Checkout Repository)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 2. 設定 Python 3.11 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 3. 安裝中文字型與 Python 套件 (含無頭瀏覽器補回支援)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk chromium-browser chromium-chromedriver || true
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy beautifulsoup4 lxml matplotlib selenium
+
+      - name: 4. 執行恒指期貨數據擷取、資料庫更新與圖表繪製
+        env:
+          TZ: Asia/Hong_Kong
+          FORCED_MONTH: ${{ github.event.inputs.forced_month }}
+        run: |
+          if [ -n "$FORCED_MONTH" ]; then
+            python3 hsi_futures_analyzer.py --month "$FORCED_MONTH"
+          else
+            python3 hsi_futures_analyzer.py
+          fi
+
+      - name: 5. (選用) 自動同步所有最新檔案至 Google Drive (HSI_Futures 資料夾)
+        # 若您在 GitHub Secrets 設定了 RCLONE_CONFIG，每次執行完會自動把 .db / .csv / .sql / .png / .html 同步回 Google Drive
+        env:
+          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          if [ -n "$RCLONE_CONFIG_CONTENT" ]; then
+            echo "[Google Drive] 偵測到 RCLONE_CONFIG，正在同步檔案至 Google Drive..."
+            sudo apt-get install -y -qq rclone
+            mkdir -p ~/.config/rclone
+            echo "$RCLONE_CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
+            for f in hsi_futures.db hsi_futures_1h.db hsi_futures_1h.sql hsi_futures_15m.db hsi_futures_15m.sql hsi_futures_15m.csv hsi_futures_1h.csv hsi_futures_1d.csv hsi_futures_chart.png hsi_futures_chart.html hsi_futures_15m_chart.png hsi_futures_15m_chart.html; do
+              if [ -f "$f" ]; then
+                rclone copy "$f" gdrive:HSI_Futures/ --drive-Chunk-Size 32M || true
+              fi
+            done
+            echo "[Google Drive] 同步完成！"
+          else
+            echo "[提示] 未設定 RCLONE_CONFIG Secret，僅儲存於 GitHub 儲存庫 (Colab 可透過 DEFAULT_GITHUB_RAW_DB_URL 自動拉取)。"
+          fi
+
+      - name: 6. 自動提交並推送最新資料庫、CSV、SQL 與圖表回 GitHub 儲存庫
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            hsi_futures.db \
+            hsi_futures_1h.db \
+            hsi_futures_1h.sql \
+            hsi_futures_15m.db \
+            hsi_futures_15m.sql \
+            hsi_futures_15m.csv \
+            hsi_futures_1h.csv \
+            hsi_futures_1d.csv \
+            hsi_futures_chart.png \
+            hsi_futures_chart.html \
+            hsi_futures_15m_chart.png \
+            hsi_futures_15m_chart.html
+
+          if git diff --cached --quiet; then
+            echo "[Git] 數據無變動，無需提交。"
+          else
+            TIMESTAMP_HKT=$(TZ=Asia/Hong_Kong date +"%Y-%m-%d %H:%M:%S HKT")
+            git commit -m "Auto-update HSI Futures data & charts ($TIMESTAMP_HKT)"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            echo "[Git] 已成功推送最新數據與圖表至 GitHub！"
+          fi
