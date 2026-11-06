@@ -42,7 +42,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: 3. 安裝中文字型與 Python 套件 (含無頭瀏覽器補回支援)
         run: |
@@ -54,6 +53,7 @@ jobs:
       - name: 4. 執行恒指期貨數據擷取、資料庫更新與圖表繪製
         env:
           TZ: Asia/Hong_Kong
+          HSI_GITHUB_RAW_DB_URL: ""
           FORCED_MONTH: ${{ github.event.inputs.forced_month }}
         run: |
           if [ -n "$FORCED_MONTH" ]; then
@@ -63,10 +63,8 @@ jobs:
           fi
 
       - name: 5. (選用) 自動同步所有最新檔案至 Google Drive (HSI_Futures 資料夾)
-        # 若您在 GitHub Secrets 設定了 RCLONE_CONFIG，每次執行完會自動把 .db / .csv / .sql / .png / .html 同步回 Google Drive
         env:
           RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           if [ -n "$RCLONE_CONFIG_CONTENT" ]; then
             echo "[Google Drive] 偵測到 RCLONE_CONFIG，正在同步檔案至 Google Drive..."
@@ -75,12 +73,12 @@ jobs:
             echo "$RCLONE_CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
             for f in hsi_futures.db hsi_futures_1h.db hsi_futures_1h.sql hsi_futures_15m.db hsi_futures_15m.sql hsi_futures_15m.csv hsi_futures_1h.csv hsi_futures_1d.csv hsi_futures_chart.png hsi_futures_chart.html hsi_futures_15m_chart.png hsi_futures_15m_chart.html; do
               if [ -f "$f" ]; then
-                rclone copy "$f" gdrive:HSI_Futures/ --drive-Chunk-Size 32M || true
+                rclone copy "$f" gdrive:HSI_Futures/ --drive-chunk-size 32M || true
               fi
             done
             echo "[Google Drive] 同步完成！"
           else
-            echo "[提示] 未設定 RCLONE_CONFIG Secret，僅儲存於 GitHub 儲存庫 (Colab 可透過 DEFAULT_GITHUB_RAW_DB_URL 自動拉取)。"
+            echo "[提示] 未設定 RCLONE_CONFIG Secret，直接儲存於 GitHub 儲存庫。"
           fi
 
       - name: 6. 自動提交並推送最新資料庫、CSV、SQL 與圖表回 GitHub 儲存庫
