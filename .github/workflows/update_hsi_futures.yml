@@ -13,12 +13,13 @@ on:
   # 對應香港時間 (HKT):
   # - 早市: 10:03 (02:03 UTC)、11:03 (03:03 UTC)、12:05 (04:05 UTC 早市收市)
   # - 午市: 14:03 (06:03 UTC)、15:03 (07:03 UTC)、16:03 (08:03 UTC)
-  # - 日市收市鎖定全日25筆數據: 16:35 (08:35 UTC) 及 17:15 (09:15 UTC 二次保險備份)
+  # - 日市收市鎖定全日25筆數據: 16:35 (08:35 UTC)、17:15 (09:15 UTC) 及 20:00 (12:00 UTC 晚間完整性自檢保險)
   schedule:
     - cron: "3 2,3,6,7,8 * * 1-5"
     - cron: "5 4 * * 1-5"
     - cron: "35 8 * * 1-5"
     - cron: "15 9 * * 1-5"
+    - cron: "0 12 * * 1-5"
 
 permissions:
   contents: write
@@ -30,7 +31,7 @@ concurrency:
 jobs:
   collect-and-analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: 1. 檢出儲存庫 (Checkout Repository)
@@ -43,14 +44,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 3. 安裝中文字型與 Python 套件 (含無頭瀏覽器補回支援)
+      - name: 3. 安裝中文字型、無頭瀏覽器與 Python 套件 (支援 15 日缺漏自動補回)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq fonts-noto-cjk chromium-browser chromium-chromedriver || true
           python -m pip install --upgrade pip
           pip install requests pandas numpy beautifulsoup4 lxml matplotlib selenium
 
-      - name: 4. 執行恒指期貨數據擷取、資料庫更新與圖表繪製
+      - name: 4. 執行恒指期貨數據擷取、殘缺日自動補齊、資料庫更新與圖表繪製
         env:
           TZ: Asia/Hong_Kong
           HSI_GITHUB_RAW_DB_URL: ""
@@ -60,6 +61,12 @@ jobs:
             python3 hsi_futures_analyzer.py --month "$FORCED_MONTH"
           else
             python3 hsi_futures_analyzer.py
+          fi
+          if [ -f "hsi_5min_preclose_forecaster.py" ]; then
+            python3 hsi_5min_preclose_forecaster.py || true
+          fi
+          if [ -f "hsi_hourly_50ma_strategy.py" ]; then
+            python3 hsi_hourly_50ma_strategy.py || true
           fi
 
       - name: 5. (選用) 自動同步所有最新檔案至 Google Drive (HSI_Futures 資料夾)
@@ -71,7 +78,7 @@ jobs:
             sudo apt-get install -y -qq rclone
             mkdir -p ~/.config/rclone
             echo "$RCLONE_CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
-            for f in hsi_futures.db hsi_futures_1h.db hsi_futures_1h.sql hsi_futures_15m.db hsi_futures_15m.sql hsi_futures_15m.csv hsi_futures_1h.csv hsi_futures_1d.csv hsi_futures_chart.png hsi_futures_chart.html hsi_futures_15m_chart.png hsi_futures_15m_chart.html; do
+            for f in hsi_futures.db hsi_futures_1h.db hsi_futures_1h.sql hsi_futures_15m.db hsi_futures_15m.sql hsi_futures_15m.csv hsi_futures_1h.csv hsi_futures_1d.csv hsi_futures_chart.png hsi_futures_chart.html hsi_futures_15m_chart.png hsi_futures_15m_chart.html hsi_5min_preclose_forecast_chart.png hsi_hourly_50ma_strategy_chart.png hsi_hourly_50ma_strategy_chart.html hsi_hourly_50ma_strategy.db hsi_hourly_50ma_strategy.sql hsi_hourly_50ma_strategy_signals.csv hsi_hourly_50ma_strategy_trades.csv; do
               if [ -f "$f" ]; then
                 rclone copy "$f" gdrive:HSI_Futures/ --drive-chunk-size 32M || true
               fi
@@ -86,19 +93,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add \
-            hsi_futures.db \
-            hsi_futures_1h.db \
-            hsi_futures_1h.sql \
-            hsi_futures_15m.db \
-            hsi_futures_15m.sql \
-            hsi_futures_15m.csv \
-            hsi_futures_1h.csv \
-            hsi_futures_1d.csv \
-            hsi_futures_chart.png \
-            hsi_futures_chart.html \
-            hsi_futures_15m_chart.png \
-            hsi_futures_15m_chart.html
+          for f in hsi_futures.db hsi_futures_1h.db hsi_futures_1h.sql hsi_futures_15m.db hsi_futures_15m.sql hsi_futures_15m.csv hsi_futures_1h.csv hsi_futures_1d.csv hsi_futures_chart.png hsi_futures_chart.html hsi_futures_15m_chart.png hsi_futures_15m_chart.html hsi_5min_preclose_forecast_chart.png hsi_hourly_50ma_strategy_chart.png hsi_hourly_50ma_strategy_chart.html hsi_hourly_50ma_strategy.db hsi_hourly_50ma_strategy.sql hsi_hourly_50ma_strategy_signals.csv hsi_hourly_50ma_strategy_trades.csv; do
+            if [ -f "$f" ]; then
+              git add "$f"
+            fi
+          done
 
           if git diff --cached --quiet; then
             echo "[Git] 數據無變動，無需提交。"
