@@ -1,5 +1,5 @@
 -- 恒生指數期貨 (HSI Futures) 每小時 K 線與技術指標檢查 SQL 檔
--- 生成時間 (HKT): 2026-11-20 17:01:30
+-- 生成時間 (HKT): 2026-11-20 17:33:43
 
 BEGIN TRANSACTION;
 CREATE TABLE hourly_bars (
